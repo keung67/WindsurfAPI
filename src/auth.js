@@ -382,9 +382,14 @@ export function getApiKey(excludeKeys = [], modelKey = null) {
   }
   if (candidates.length === 0) return null;
 
-  // Pick the account with the highest remaining ratio. Ties broken by
-  // least-recently-used so a burst spreads across accounts evenly.
+  // Pick the account with the fewest in-flight requests first (so a burst
+  // of concurrent calls spreads across accounts instead of piling onto a
+  // single one that still has RPM headroom — see issue #37). Then prefer
+  // accounts with the highest remaining-ratio, finally least-recently-used.
   candidates.sort((x, y) => {
+    const ix = x.account._inflight || 0;
+    const iy = y.account._inflight || 0;
+    if (ix !== iy) return ix - iy;
     const rx = (x.limit - x.used) / x.limit;
     const ry = (y.limit - y.used) / y.limit;
     if (ry !== rx) return ry - rx;
@@ -394,11 +399,25 @@ export function getApiKey(excludeKeys = [], modelKey = null) {
   const { account } = candidates[0];
   account._rpmHistory.push(now);
   account.lastUsed = now;
+  account._inflight = (account._inflight || 0) + 1;
   return {
     id: account.id, email: account.email, apiKey: account.apiKey,
     apiServerUrl: account.apiServerUrl || '',
     proxy: getEffectiveProxy(account.id) || null,
   };
+}
+
+/**
+ * Decrement the in-flight counter for an account after a chat request
+ * finishes (success OR failure). Callers MUST pair every successful
+ * getApiKey/acquireAccountByKey with a releaseAccount in finally, or the
+ * in-flight balancing will drift and the account will look permanently busy.
+ */
+export function releaseAccount(apiKey) {
+  if (!apiKey) return;
+  const a = accounts.find(x => x.apiKey === apiKey);
+  if (!a) return;
+  a._inflight = Math.max(0, (a._inflight || 0) - 1);
 }
 
 /**
@@ -421,6 +440,7 @@ export function acquireAccountByKey(apiKey, modelKey = null) {
   if (modelKey && !isModelAllowedForAccount(a, modelKey)) return null;
   a._rpmHistory.push(now);
   a.lastUsed = now;
+  a._inflight = (a._inflight || 0) + 1;
   return {
     id: a.id, email: a.email, apiKey: a.apiKey,
     apiServerUrl: a.apiServerUrl || '',

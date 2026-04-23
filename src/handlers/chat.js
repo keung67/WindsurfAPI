@@ -5,7 +5,7 @@
 
 import { randomUUID } from 'crypto';
 import { WindsurfClient } from '../client.js';
-import { getApiKey, acquireAccountByKey, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited } from '../auth.js';
+import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited } from '../auth.js';
 import { resolveModel, getModelInfo } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
@@ -331,6 +331,7 @@ export async function handleChatCompletions(body) {
     }
     tried.push(acct.apiKey);
 
+    try {
     // Pre-flight rate limit check (experimental): ask server.codeium.com if
     // this account still has message capacity before burning an LS round trip.
     if (isExperimentalEnabled('preflightRateLimit')) {
@@ -417,6 +418,12 @@ export async function handleChatCompletions(body) {
       continue;
     }
     break; // other errors (502, transport) — don't retry
+    } finally {
+      // Pair every successful getApiKey/acquireAccountByKey with a release
+      // so the in-flight-count based balancer in auth.js (issue #37) stays
+      // accurate across success, retry, and abort paths.
+      releaseAccount(acct.apiKey);
+    }
   }
   // If all accounts exhausted, check if it's because they're all rate-limited
   if (!lastErr || lastErr.status === 429) {
@@ -797,6 +804,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
           tried.push(acct.apiKey);
           currentApiKey = acct.apiKey;
 
+          try {
           // Pre-flight rate limit check (experimental)
           if (isExperimentalEnabled('preflightRateLimit')) {
             try {
@@ -921,6 +929,12 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               continue;
             }
             break;
+          }
+          } finally {
+            // Pair every successful getApiKey/acquireAccountByKey with a
+            // release so the in-flight balancer in auth.js (issue #37)
+            // stays accurate through stream success, retry, and abort.
+            releaseAccount(acct.apiKey);
           }
         }
 
