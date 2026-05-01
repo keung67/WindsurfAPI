@@ -287,7 +287,7 @@ export function annotateRiskyReadToolResult(content, { toolName = '', isError = 
 
 // ─── OpenAI → Anthropic non-stream response translation ──────
 
-function openAIToAnthropic(result, model, msgId) {
+export function openAIToAnthropic(result, model, msgId) {
   const choice = result.choices?.[0];
   const usage = result.usage || {};
   const content = [];
