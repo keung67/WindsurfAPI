@@ -242,6 +242,15 @@
       "mergedAt": "2026-05-12",
       "title": "refactor(dashboard): UI cleanup",
       "summary": "Dashboard 前端大重构：1177 行新增 / 465 行删除，全部集中在 index.html。清理了冗余样式、统一了组件风格、优化了卡片布局和响应式适配。"
+    },
+    {
+      "login": "The-five-stooges",
+      "pr": 188,
+      "weight": "S",
+      "weightLabel": "Sticky Session 流式路径修复 + 多用户隔离",
+      "mergedAt": "2026-06-02",
+      "title": "fix: sticky session binding breaks on streaming path + multi-user isolation with body.user",
+      "summary": "修复 sticky session 在流式路径的两个关键问题：① waitForAccount 在流式 retry 路径缺少 callerKey 参数，导致 sticky 绑定在流式请求中不生效；② 新增 body.user 多用户隔离机制，允许不同用户在共享 API key 下保持独立的 session 绑定。配套添加了 stickyNoFallback 开关（绑定账号失败时不回退到其他账号）、stickyBindByUserOnly 开关（忽略模型维度按 user 绑定）、以及 Dashboard 配置面板。320 行新增，涉及 sticky-session / auth / chat / messages / runtime-config / dashboard 六个子系统。"
     }
   ]
 }

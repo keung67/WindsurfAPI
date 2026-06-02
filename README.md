@@ -412,6 +412,8 @@ A: 八成是用了周限模型 — `claude-opus-4-7-max` / `gpt-5.5-xhigh` / `cl
   Astraflow 第三方提供商接入。
 - [@datfooldive](https://github.com/datfooldive) — [PR #173](https://github.com/dwgx/WindsurfAPI/pull/173)
   Dashboard UI 大扫除：统一组件风格、优化卡片布局和响应式适配。
+- [@The-five-stooges](https://github.com/The-five-stooges) — [PR #188](https://github.com/dwgx/WindsurfAPI/pull/188)
+  Sticky session 流式路径修复 + body.user 多用户隔离机制 + stickyNoFallback / stickyBindByUserOnly 双开关。
 
 想加入这份名单？欢迎提 [issue](https://github.com/dwgx/WindsurfAPI/issues) 或 [pull request](https://github.com/dwgx/WindsurfAPI/pulls)。Dashboard 左侧有"致谢"面板 能看到同样的信息。
 

@@ -428,6 +428,8 @@ Huge thanks to the following folks who sent pull requests or systematically audi
   Added Astraflow as a third-party provider.
 - [@datfooldive](https://github.com/datfooldive) — [PR #173](https://github.com/dwgx/WindsurfAPI/pull/173)
   Dashboard UI overhaul: unified component styles, improved card layouts and responsive design.
+- [@The-five-stooges](https://github.com/The-five-stooges) — [PR #188](https://github.com/dwgx/WindsurfAPI/pull/188)
+  Sticky session streaming-path fix + body.user multi-user isolation + stickyNoFallback / stickyBindByUserOnly toggles.
 
 Want to be on this list? Open an [issue](https://github.com/dwgx/WindsurfAPI/issues) or a [pull request](https://github.com/dwgx/WindsurfAPI/pulls). The dashboard has a Credits panel on the left that shows the same info.
 
