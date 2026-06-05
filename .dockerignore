@@ -18,6 +18,8 @@ docs
 audit
 scripts/*
 !scripts/native-bridge-smoke.mjs
+!scripts/lsp-capacity-matrix.mjs
+!scripts/web-search-direct-probe.mjs
 bugsy
 windsurf-api
 codeium.zip
