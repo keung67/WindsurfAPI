@@ -278,7 +278,8 @@ In your client's settings for **Custom OpenAI Compatible**:
 | `LS_DATA_DIR` | Linux: `/opt/windsurf/data`; macOS: `~/.windsurf/data` | Per-proxy LS data directory root. |
 | `LS_MAX_INSTANCES` | adaptive, max `20` | Maximum LS pool size. The adaptive default reserves at least one non-default proxy slot on small hosts. |
 | `LS_SPAWN_MIN_AVAILABLE_BYTES` | `700MB` | Minimum available memory required before starting a new non-default LS. |
-| `LS_PREWARM_PROXIES` | `0` | Set to `1` to prewarm all proxy LS instances on startup. Scheduled probes and predictive prewarm only reuse resident/pending LS instances. |
+| `LS_PREWARM_DEFAULT` | `1` | Set to `0` to skip startup default-LS prewarm and start LS lazily on first request. Useful for low-memory, all-proxy pools. |
+| `LS_PREWARM_PROXIES` | `0` | Set to `1` to prewarm all proxy LS instances on startup. Scheduled probes and predictive prewarm only reuse idle resident LS instances. |
 | `LS_PREWARM_ON_ACCOUNT_ADD` | `0` | Set to `1` to prewarm LS immediately after dashboard/import/OAuth account add. Default avoids memory spikes during bulk import. |
 | `WINDSURFAPI_NATIVE_TOOL_BRIDGE` | empty | `all_mapped` enables native bridge only when every tool is in the Read/Bash/Grep/Glob semantic families; `1` enables partition mode for mixed toolsets. WebSearch/WebFetch stay on prompt emulation unless explicitly allowlisted. |
 | `WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS` | Read/Bash/Grep/Glob families | Tool allowlist for native bridge. Defaults include aliases such as `read_file`, `view_file`, `shell_command`, `run_command`, `grep_search_v2`, and `find`; excludes WebSearch/WebFetch. |

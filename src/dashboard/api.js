@@ -601,11 +601,19 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   // POST /accounts/probe-all — probe every active account
   if (subpath === '/accounts/probe-all' && method === 'POST') {
     const list = getAccountList().filter(a => a.status === 'active');
+    const force = body?.force === true || body?.allowLsStart === true;
     const results = [];
     for (const a of list) {
       try {
-        const r = await probeAccount(a.id);
-        results.push({ id: a.id, email: a.email, tier: r?.tier || 'unknown' });
+        const r = await probeAccount(a.id, { allowLsStart: force });
+        results.push({
+          id: a.id,
+          email: a.email,
+          tier: r?.tier || 'unknown',
+          skipped: !!r?.skipped,
+          reason: r?.reason || null,
+          admission: r?.admission || null,
+        });
       } catch (err) {
         results.push({ id: a.id, email: a.email, error: err.message });
       }
@@ -617,7 +625,8 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   const accountProbe = subpath.match(/^\/accounts\/([^/]+)\/probe$/);
   if (accountProbe && method === 'POST') {
     try {
-      const result = await probeAccount(accountProbe[1]);
+      const force = body?.force === true || body?.allowLsStart === true;
+      const result = await probeAccount(accountProbe[1], { allowLsStart: force });
       if (!result) return json(res, 404, { error: 'Account not found' });
       return json(res, 200, { success: true, ...result });
     } catch (err) {

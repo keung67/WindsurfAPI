@@ -137,6 +137,10 @@ const _pool = new Map();
 // same key share one spawn + readiness wait. Without this, both callers
 // would each spawn an LS process, race on the port, and leave an orphan.
 const _pending = new Map();
+// Evicted processes are kept as reservations until the OS confirms exit.
+// This prevents transient RSS spikes where old and new LS workers overlap.
+const _stopping = new Map();
+let _startAdmissionQueue = Promise.resolve();
 // Track which LS keys are being shut down intentionally so the exit handler
 // doesn't fire an auto-restart for them. Without this, stopLanguageServer()
 // and restartLsForProxy() would trigger unwanted respawns.
@@ -289,32 +293,122 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function evictLruIdleNonDefault() {
+async function waitPortReadyOrProcessExit(proc, port, timeoutMs) {
+  let cleanup = () => {};
+  const procFailure = new Promise((resolve, reject) => {
+    try {
+      const onError = (err) => reject(err);
+      const onExit = (code, signal) => {
+        reject(new Error(`LS process exited before ready: code=${code} signal=${signal}`));
+      };
+      proc.once('error', onError);
+      proc.once('exit', onExit);
+      cleanup = () => {
+        try { proc.off?.('error', onError); } catch {}
+        try { proc.off?.('exit', onExit); } catch {}
+      };
+    } catch (e) {
+      reject(e);
+    }
+  });
+  try {
+    return await Promise.race([waitPortReady(port, timeoutMs), procFailure]);
+  } finally {
+    cleanup();
+  }
+}
+
+function withStartAdmissionLock(fn) {
+  const prev = _startAdmissionQueue;
+  let release;
+  _startAdmissionQueue = new Promise(resolve => { release = resolve; });
+  return (async () => {
+    try { await prev; } catch {}
+    try { return await fn(); }
+    finally { release(); }
+  })();
+}
+
+function poolOccupancy() {
+  return _pool.size + _stopping.size;
+}
+
+function activeSpawnReservationCount(excludeKey = '') {
+  let count = 0;
+  for (const [key, entry] of _pool) {
+    if (key === excludeKey) continue;
+    if (entry && !entry.ready) count++;
+  }
+  for (const key of _pending.keys()) {
+    if (key === excludeKey) continue;
+    if (!_pool.has(key)) count++;
+  }
+  return count;
+}
+
+const LS_EVICT_READY_GRACE_MS = positiveIntEnv('LS_EVICT_READY_GRACE_MS', 5000, 0);
+
+function findIdleNonDefaultEvictionCandidate() {
   let lruKey = null;
   let lruTime = Infinity;
+  const now = Date.now();
   for (const [k, e] of _pool) {
     if (k === 'default') continue;
+    if (!e?.ready) continue;
     if ((e.activeRequests || 0) > 0) continue;
+    if (e.readyAt && now - e.readyAt < LS_EVICT_READY_GRACE_MS) continue;
     const at = e.lastUsedAt || e._evictAt || e.startedAt || 0;
     if (at < lruTime) { lruTime = at; lruKey = k; }
   }
   if (!lruKey) return null;
-  const evicted = _pool.get(lruKey);
-  _intentionalShutdown.add(lruKey);
-  try { evicted?.process?.kill('SIGTERM'); } catch {}
-  invalidateEntryForShutdown(evicted);
+  const entry = _pool.get(lruKey);
+  return {
+    key: lruKey,
+    entry,
+    idleMs: entry?.lastUsedAt ? Math.max(0, now - entry.lastUsedAt) : null,
+  };
+}
+
+async function waitProcessExit(proc, timeoutMs) {
+  if (!proc || proc.exitCode != null || proc.signalCode != null) return 'already_exited';
+  return new Promise(resolve => {
+    let settled = false;
+    const done = (how) => {
+      if (settled) return;
+      settled = true;
+      try { proc.off?.('exit', onExit); } catch {}
+      clearTimeout(timer);
+      resolve(how);
+    };
+    const onExit = () => done('exited');
+    try { proc.once('exit', onExit); } catch { return done('no_listener'); }
+    const timer = setTimeout(() => done('timeout'), timeoutMs);
+    try { timer.unref?.(); } catch {}
+  });
+}
+
+async function evictLruIdleNonDefault() {
+  const candidate = findIdleNonDefaultEvictionCandidate();
+  if (!candidate) return null;
+  const { key: lruKey, entry: evicted } = candidate;
+  _stopping.set(lruKey, { at: Date.now(), pid: evicted?.process?.pid || null, reason: 'evicted' });
   _pool.delete(lruKey);
-  log.warn(`LS pool at cap (${MAX_LS_INSTANCES}), evicted LRU instance ${lruKey} (started ${evicted?.startedAt ? new Date(evicted.startedAt).toISOString() : '?'})`);
+  _intentionalShutdown.add(lruKey);
+  invalidateEntryForShutdown(evicted);
+  try { evicted?.process?.kill('SIGTERM'); } catch {}
+  let how = await waitProcessExit(evicted?.process, 1500);
+  if (how === 'timeout') {
+    try { evicted?.process?.kill('SIGKILL'); } catch {}
+    how = await waitProcessExit(evicted?.process, 500);
+  }
+  _stopping.delete(lruKey);
+  log.warn(`LS pool at cap (${MAX_LS_INSTANCES}), evicted LRU instance ${lruKey} (${how}; started ${evicted?.startedAt ? new Date(evicted.startedAt).toISOString() : '?'})`);
+  if (!lruKey) return null;
   return lruKey;
 }
 
 function hasIdleNonDefaultInstance() {
-  for (const [k, e] of _pool) {
-    if (k === 'default') continue;
-    if ((e.activeRequests || 0) > 0) continue;
-    return true;
-  }
-  return false;
+  return !!findIdleNonDefaultEvictionCandidate();
 }
 
 function memoryGuardSnapshot() {
@@ -335,11 +429,16 @@ function memoryGuardSnapshot() {
   };
 }
 
-export function getLsMemoryGuardStatus() {
+export function getLsMemoryGuardStatus({ reservedStarts = 0 } = {}) {
   const snap = memoryGuardSnapshot();
+  const availableBytes = snap.availableBytes == null
+    ? null
+    : Math.max(0, snap.availableBytes - (Math.max(0, reservedStarts) * DEFAULT_LS_RSS_ESTIMATE_BYTES));
   return {
     ...snap,
-    okToSpawn: !snap.enabled || snap.availableBytes == null || snap.availableBytes >= snap.minAvailableBytes,
+    reservedStarts,
+    availableBytes,
+    okToSpawn: !snap.enabled || availableBytes == null || availableBytes >= snap.minAvailableBytes,
   };
 }
 
@@ -347,7 +446,9 @@ export function getLsAdmissionStatus(proxy = null) {
   const key = proxyKey(proxy);
   const existing = _pool.get(key);
   const pending = _pending.has(key);
-  const memoryGuard = getLsMemoryGuardStatus();
+  const occupancy = poolOccupancy();
+  const evictionCandidate = findIdleNonDefaultEvictionCandidate();
+  const memoryGuard = getLsMemoryGuardStatus({ reservedStarts: activeSpawnReservationCount(key) });
   if (existing?.ready) {
     return {
       ok: true,
@@ -355,9 +456,10 @@ export function getLsAdmissionStatus(proxy = null) {
       errorType: null,
       reason: 'already_running',
       key,
-      poolSize: _pool.size,
+      poolSize: occupancy,
       maxInstances: MAX_LS_INSTANCES,
       pending,
+      activeRequests: existing.activeRequests || 0,
       memoryGuard,
     };
   }
@@ -368,7 +470,7 @@ export function getLsAdmissionStatus(proxy = null) {
       errorType: null,
       reason: 'start_pending',
       key,
-      poolSize: _pool.size,
+      poolSize: occupancy,
       maxInstances: MAX_LS_INSTANCES,
       pending,
       memoryGuard,
@@ -381,20 +483,20 @@ export function getLsAdmissionStatus(proxy = null) {
       errorType: 'ls_memory_guard',
       reason: 'memory_guard',
       key,
-      poolSize: _pool.size,
+      poolSize: occupancy,
       maxInstances: MAX_LS_INSTANCES,
       pending,
       memoryGuard,
     };
   }
-  if (key !== 'default' && _pool.size >= MAX_LS_INSTANCES && !hasIdleNonDefaultInstance()) {
+  if (key !== 'default' && occupancy >= MAX_LS_INSTANCES && !evictionCandidate) {
     return {
       ok: false,
       wouldStart: true,
       errorType: 'ls_pool_exhausted',
       reason: 'pool_full_no_idle',
       key,
-      poolSize: _pool.size,
+      poolSize: occupancy,
       maxInstances: MAX_LS_INSTANCES,
       pending,
       memoryGuard,
@@ -406,9 +508,12 @@ export function getLsAdmissionStatus(proxy = null) {
     errorType: null,
     reason: 'can_start',
     key,
-    poolSize: _pool.size,
+    poolSize: occupancy,
     maxInstances: MAX_LS_INSTANCES,
     pending,
+    poolFull: occupancy >= MAX_LS_INSTANCES,
+    willEvict: key !== 'default' && occupancy >= MAX_LS_INSTANCES && !!evictionCandidate,
+    evictionCandidateKey: key !== 'default' && occupancy >= MAX_LS_INSTANCES ? evictionCandidate?.key || null : null,
     memoryGuard,
   };
 }
@@ -417,8 +522,8 @@ async function waitForPoolCapacity(key) {
   if (key === 'default') return;
   const start = Date.now();
   let logged = false;
-  while (_pool.size >= MAX_LS_INSTANCES) {
-    if (evictLruIdleNonDefault()) return;
+  while (poolOccupancy() >= MAX_LS_INSTANCES) {
+    if (await evictLruIdleNonDefault()) return;
     const remaining = LS_POOL_WAIT_MS - (Date.now() - start);
     if (remaining <= 0) {
       throw lsPoolExhaustedError(`LS pool at cap (${MAX_LS_INSTANCES}) and no idle non-default instance became evictable within ${LS_POOL_WAIT_MS}ms`);
@@ -438,7 +543,7 @@ async function waitForMemoryHeadroom(key) {
   const start = Date.now();
   let logged = false;
   while (true) {
-    const snap = memoryGuardSnapshot();
+    const snap = getLsMemoryGuardStatus({ reservedStarts: activeSpawnReservationCount(key) });
     if (snap.availableBytes == null || snap.availableBytes >= snap.minAvailableBytes) return;
     const remaining = LS_POOL_WAIT_MS - (Date.now() - start);
     if (remaining <= 0) {
@@ -705,16 +810,38 @@ export async function ensureLs(proxy = null) {
   if (pending) return pending;
 
   const promise = (async () => {
-    await waitForPoolCapacity(key);
-    await waitForMemoryHeadroom(key);
-    const nowExisting = _pool.get(key);
-    if (nowExisting?.ready) {
-      touchEntry(nowExisting);
-      return nowExisting;
-    }
+    let entry = null;
+    let reservedByThisCall = false;
+    await withStartAdmissionLock(async () => {
+      await waitForPoolCapacity(key);
+      await waitForMemoryHeadroom(key);
+      const nowExisting = _pool.get(key);
+      if (nowExisting?.ready) {
+        touchEntry(nowExisting);
+        entry = nowExisting;
+        return;
+      }
+      entry = nowExisting || {
+        key,
+        proxy,
+        startedAt: Date.now(),
+        lastUsedAt: Date.now(),
+        activeRequests: 0,
+        ready: false,
+        generation: randomUUID(),
+        workspaceInit: null,
+        sessionId: null,
+      };
+      if (!nowExisting) {
+        reservedByThisCall = true;
+        _pool.set(key, entry);
+      }
+    });
+    if (entry?.ready) return entry;
 
-    const isDefault = key === 'default';
-    let port = isDefault ? DEFAULT_PORT : _nextPort++;
+    try {
+      const isDefault = key === 'default';
+      let port = isDefault ? DEFAULT_PORT : _nextPort++;
 
     // If something is already listening on the default port, NEVER adopt
     // blindly — even a probe-based gRPC signature is spoofable by any local
@@ -839,34 +966,39 @@ export async function ensureLs(proxy = null) {
       _pool.delete(key);
     });
 
-    const entry = {
-      key,
+    Object.assign(entry, {
       process: proc, port, csrfToken: DEFAULT_CSRF,
-      proxy, startedAt: Date.now(), lastUsedAt: Date.now(), activeRequests: 0, ready: false,
+      proxy, lastUsedAt: Date.now(), activeRequests: entry.activeRequests || 0, ready: false,
       // v2.0.25 LOW-1: per-spawn UUID so the conversation pool can tell a
       // new LS that landed on the same port apart from the dead one. Used
       // by checkout(expected={lsGeneration}) and invalidateFor({lsGeneration}).
-      generation: randomUUID(),
+      generation: entry.generation || randomUUID(),
       // One-shot Cascade workspace init promise. cascadeChat() awaits this so
       // the heavy InitializePanelState / AddTrackedWorkspace / UpdateWorkspaceTrust
       // trio only runs once per LS lifetime instead of once per request.
-      workspaceInit: null,
-      sessionId: null,
-    };
-    _pool.set(key, entry);
+      workspaceInit: entry.workspaceInit || null,
+      sessionId: entry.sessionId || null,
+    });
 
-    try {
-      await waitPortReady(port, 25000);
-      entry.ready = true;
-      touchEntry(entry);
-      log.info(`LS instance ${key} ready on port ${port}`);
+      try {
+        await waitPortReadyOrProcessExit(proc, port, 25000);
+        entry.ready = true;
+        entry.readyAt = Date.now();
+        touchEntry(entry);
+        log.info(`LS instance ${key} ready on port ${port}`);
+      } catch (err) {
+        log.error(`LS instance ${key} failed to become ready: ${err.message}`);
+        try { proc.kill('SIGKILL'); } catch {}
+        _pool.delete(key);
+        throw err;
+      }
+    return entry;
     } catch (err) {
-      log.error(`LS instance ${key} failed to become ready: ${err.message}`);
-      try { proc.kill('SIGKILL'); } catch {}
-      _pool.delete(key);
+      if (reservedByThisCall && _pool.get(key) === entry && !entry?.process) {
+        _pool.delete(key);
+      }
       throw err;
     }
-    return entry;
   })();
 
   _pending.set(key, promise);
@@ -994,12 +1126,16 @@ export function getCsrfToken() {
   return _pool.get('default')?.csrfToken || DEFAULT_CSRF;
 }
 
+export function configureLanguageServer(opts = {}) {
+  _binaryPath = opts.binaryPath || process.env.LS_BINARY_PATH || _binaryPath;
+  _apiServerUrl = opts.apiServerUrl || process.env.CODEIUM_API_URL || _apiServerUrl;
+}
+
 /**
  * Legacy entry point used by index.js — starts the default (no-proxy) LS.
  */
 export async function startLanguageServer(opts = {}) {
-  _binaryPath = opts.binaryPath || process.env.LS_BINARY_PATH || _binaryPath;
-  _apiServerUrl = opts.apiServerUrl || process.env.CODEIUM_API_URL || _apiServerUrl;
+  configureLanguageServer(opts);
   const def = await ensureLs(null);
   return { port: def.port, csrfToken: def.csrfToken };
 }

@@ -104,22 +104,50 @@ describe('language server resource policy', () => {
     assert.match(AUTH_JS, /process\.env\.LS_PREWARM_PROXIES === '1'/);
   });
 
+  test('default LS startup prewarm can be disabled for low-memory pools', () => {
+    const src = readFileSync(join(__dirname, '..', 'src/index.js'), 'utf8');
+    assert.match(src, /configureLanguageServer\(lsConfig\)/);
+    assert.match(src, /process\.env\.LS_PREWARM_DEFAULT !== '0'/);
+    assert.match(src, /LS default prewarm disabled/);
+  });
+
   test('dashboard account-add LS warmup is opt-in', () => {
     const src = readFileSync(join(__dirname, '..', 'src/dashboard/api.js'), 'utf8');
     assert.match(src, /LS_PREWARM_ON_ACCOUNT_ADD === '1'/);
     assert.match(src, /function scheduleAccountWarmup/);
   });
 
-  test('scheduled probes only reuse resident or pending LS instances', () => {
+  test('scheduled probes only reuse idle resident LS instances', () => {
     assert.match(AUTH_JS, /const admission = getLsAdmissionForAccount\(a\.id\)/);
-    assert.match(AUTH_JS, /!admission\.ok \|\| admission\.wouldStart/);
+    assert.match(AUTH_JS, /admission\.reason !== 'already_running'/);
+    assert.match(AUTH_JS, /\(admission\.activeRequests \|\| 0\) > 0/);
     assert.match(AUTH_JS, /Scheduled probe .*wouldStart=/);
+    assert.match(AUTH_JS, /probeAccount\(a\.id, \{ allowLsStart: false \}\)/);
   });
 
   test('predictive prewarm is admission-gated and reports structured failures', () => {
     assert.match(AUTH_JS, /const admission = getLsAdmissionForAccount\(nextAccount\.id\)/);
-    assert.match(AUTH_JS, /!admission\.ok \|\| admission\.wouldStart/);
+    assert.match(AUTH_JS, /admission\.reason !== 'already_running'/);
+    assert.match(AUTH_JS, /\(admission\.activeRequests \|\| 0\) > 0/);
     assert.match(AUTH_JS, /ensureLsForAccount\(nextAccount\.id\)\)\.then\(r =>/);
     assert.match(AUTH_JS, /r\?\.errorType \|\| 'ls_start_failed'/);
+  });
+
+  test('dashboard probes are resident-only unless explicitly forced', () => {
+    const src = readFileSync(join(__dirname, '..', 'src/dashboard/api.js'), 'utf8');
+    assert.match(src, /const force = body\?\.force === true \|\| body\?\.allowLsStart === true/);
+    assert.match(src, /probeAccount\(a\.id, \{ allowLsStart: force \}\)/);
+    assert.match(src, /probeAccount\(accountProbe\[1\], \{ allowLsStart: force \}\)/);
+    assert.match(src, /skipped: !!r\?\.skipped/);
+  });
+
+  test('LS admission is serialized and never evicts starting instances', () => {
+    const ls = readFileSync(join(__dirname, '..', 'src/langserver.js'), 'utf8');
+    assert.match(ls, /function withStartAdmissionLock/);
+    assert.match(ls, /poolOccupancy\(\)/);
+    assert.match(ls, /const _stopping = new Map\(\)/);
+    assert.match(ls, /if \(!e\?\.ready\) continue/);
+    assert.match(ls, /await withStartAdmissionLock/);
+    assert.match(ls, /getLsMemoryGuardStatus\(\{ reservedStarts: activeSpawnReservationCount\(key\) \}\)/);
   });
 });

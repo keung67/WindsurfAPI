@@ -36,7 +36,7 @@ describe('probe per-account lock (#follow-up)', () => {
     // Pin both the data structure and the de-dup branch.
     assert.match(AUTH_JS, /const _probeInFlight = new Map\(\)/,
       'expected `const _probeInFlight = new Map()` to back the per-account lock');
-    const m = AUTH_JS.match(/export async function probeAccount\(id\)\s*\{([\s\S]+?)\n\}/);
+    const m = AUTH_JS.match(/export async function probeAccount\(id(?:,[^)]*)?\)\s*\{([\s\S]+?)\n\}/);
     assert.ok(m, 'probeAccount(id) entry not found');
     const body = m[1];
     assert.match(body, /_probeInFlight\.get\(id\)/,
@@ -52,7 +52,7 @@ describe('probe per-account lock (#follow-up)', () => {
   test('null return is reserved exclusively for "account not found"', () => {
     // The dashboard handler maps `null` -> 404 "Account not found", so
     // probeAccount must never return null for any other reason.
-    const m = AUTH_JS.match(/export async function probeAccount\(id\)\s*\{([\s\S]+?)\n\}/);
+    const m = AUTH_JS.match(/export async function probeAccount\(id(?:,[^)]*)?\)\s*\{([\s\S]+?)\n\}/);
     assert.ok(m);
     const body = m[1];
     // The only `return null` should be the `accounts.find(...) === undefined` branch.

@@ -788,7 +788,7 @@ function schedulePrewarm(nextAccount) {
   const now = Date.now();
   if (nextAccount._prewarmAt && now - nextAccount._prewarmAt < PREWARM_COOLDOWN_MS) return;
   const admission = getLsAdmissionForAccount(nextAccount.id);
-  if (!admission.ok || admission.wouldStart) {
+  if (!admission.ok || admission.reason !== 'already_running' || (admission.activeRequests || 0) > 0) {
     log.debug(`Prewarm ${nextAccount.id} skipped: ${admission.errorType || admission.reason} (wouldStart=${!!admission.wouldStart}, ls=${admission.key || '?'})`);
     return;
   }
@@ -1496,12 +1496,25 @@ const PROBE_CANARIES = [
 // so the caller awaits the same result without firing a second probe.
 const _probeInFlight = new Map();
 
-export async function probeAccount(id) {
+export async function probeAccount(id, { allowLsStart = true } = {}) {
   const existing = _probeInFlight.get(id);
   if (existing) return existing;
 
   const account = accounts.find(a => a.id === id);
   if (!account) return null;
+
+  if (!allowLsStart) {
+    const admission = getLsAdmissionForAccount(id);
+    if (!admission.ok || admission.reason !== 'already_running' || (admission.activeRequests || 0) > 0) {
+      return {
+        skipped: true,
+        reason: admission.errorType || admission.reason || 'ls_not_idle_resident',
+        tier: account.tier || 'unknown',
+        capabilities: account.capabilities || {},
+        admission,
+      };
+    }
+  }
 
   const promise = _probeAccountImpl(account).finally(() => {
     _probeInFlight.delete(id);
@@ -1878,11 +1891,11 @@ export async function initAuth() {
     for (const a of accounts) {
       if (a.status !== 'active') continue;
       const admission = getLsAdmissionForAccount(a.id);
-      if (!admission.ok || admission.wouldStart) {
+      if (!admission.ok || admission.reason !== 'already_running' || (admission.activeRequests || 0) > 0) {
         log.info(`Scheduled probe ${a.id} skipped: ${admission.errorType || admission.reason} (wouldStart=${!!admission.wouldStart}, ls=${admission.key || '?'})`);
         continue;
       }
-      try { await probeAccount(a.id); }
+      try { await probeAccount(a.id, { allowLsStart: false }); }
       catch (e) { log.warn(`Scheduled probe ${a.id} failed: ${e.message}`); }
     }
   }, REPROBE_INTERVAL).unref?.();
