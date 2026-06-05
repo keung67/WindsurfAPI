@@ -10,6 +10,7 @@ const noExitOnFailure = process.env.NATIVE_BRIDGE_SMOKE_NO_EXIT_ON_FAILURE === '
 const requestTimeoutMs = Math.max(5_000, Number(process.env.NATIVE_BRIDGE_SMOKE_TIMEOUT_MS || 120_000));
 const streamEarlyTool = process.env.NATIVE_BRIDGE_SMOKE_EARLY_TOOL !== '0';
 const includeEnv = process.env.NATIVE_BRIDGE_SMOKE_ENV !== '0';
+const includeHealth = process.env.NATIVE_BRIDGE_SMOKE_HEALTH !== '0';
 async function sha256Hex(text) {
   const bytes = new TextEncoder().encode(String(text || ''));
   const digest = await crypto.subtle.digest('SHA-256', bytes);
@@ -30,6 +31,27 @@ const requestedScenarios = String(process.env.NATIVE_BRIDGE_SMOKE_TOOLS || 'Bash
 if (!apiKey) {
   console.error('API_KEY is required. Enable native bridge with narrow gates before this smoke.');
   process.exit(2);
+}
+
+function truncate(text, max = 1200) {
+  const s = String(text || '');
+  return s.length > max ? `${s.slice(0, max)}...<truncated ${s.length - max} chars>` : s;
+}
+
+function compactText(text, max = 1200) {
+  return truncate(String(text || '').replace(/\s+/g, ' ').trim(), max);
+}
+
+function smokeError(message, diagnostic = null) {
+  const err = new Error(message);
+  if (diagnostic) err.diagnostic = diagnostic;
+  return err;
+}
+
+function resultFromError(error) {
+  const out = { ok: false, error: String(error?.message || error) };
+  if (error?.diagnostic) out.diagnostic = error.diagnostic;
+  return out;
 }
 
 function fnTool(name, properties, required = []) {
@@ -210,6 +232,48 @@ function parseSse(text) {
   return frames;
 }
 
+function streamDiagnostics(text, calls = []) {
+  const frames = parseSse(text);
+  const contents = [];
+  const reasoning = [];
+  const finishReasons = [];
+  const usageFrames = [];
+  const responseIds = [];
+  for (const frame of frames) {
+    if (frame?.id) responseIds.push(frame.id);
+    if (frame?.usage) usageFrames.push(frame.usage);
+    for (const choice of (frame?.choices || [])) {
+      if (choice?.finish_reason) finishReasons.push(choice.finish_reason);
+      if (choice?.delta?.content) contents.push(choice.delta.content);
+      if (choice?.delta?.reasoning_content) reasoning.push(choice.delta.reasoning_content);
+      if (choice?.message?.content) contents.push(choice.message.content);
+    }
+  }
+  return {
+    frameCount: frames.length,
+    responseIds: [...new Set(responseIds)].slice(0, 3),
+    finishReasons: [...new Set(finishReasons)],
+    toolCallNames: namesFromCalls(calls),
+    contentPreview: compactText(contents.join('')),
+    reasoningPreview: compactText(reasoning.join('')),
+    usage: usageFrames.at(-1) || null,
+    seenDone: /(?:^|\n)data:\s*\[DONE\]/.test(text),
+    rawPreview: compactText(text),
+  };
+}
+
+function nonStreamDiagnostics(json, rawText, calls = []) {
+  const choice = json?.choices?.[0] || {};
+  const message = choice.message || {};
+  return {
+    finishReason: choice.finish_reason || null,
+    toolCallNames: namesFromCalls(calls),
+    contentPreview: compactText(message.content || ''),
+    usage: json?.usage || null,
+    rawPreview: compactText(rawText),
+  };
+}
+
 function collectStreamToolCalls(text) {
   return parseSse(text).flatMap(f => (f.choices || [])
     .flatMap(choice => choice.delta?.tool_calls || []));
@@ -219,22 +283,36 @@ function namesFromCalls(calls) {
   return calls.map(c => c.function?.name || c.name || '').filter(Boolean);
 }
 
-function assertExpectedTool(calls, scenarioName, expected) {
+function assertExpectedTool(calls, scenarioName, expected, diagnostic = null) {
   const names = namesFromCalls(calls);
-  if (!names.length) throw new Error(`${scenarioName}: produced no tool_calls`);
+  if (!names.length) throw smokeError(`${scenarioName}: produced no tool_calls`, diagnostic);
   if (expected && !names.includes(expected)) {
-    throw new Error(`${scenarioName}: expected ${expected}, got ${names.join(',')}`);
+    throw smokeError(`${scenarioName}: expected ${expected}, got ${names.join(',')}`, diagnostic);
   }
   return names;
 }
 
 async function runNonStream(name, scenario) {
   const res = await post(requestBody(scenario, false));
-  if (res.status !== 200) throw new Error(`${name} non-stream HTTP ${res.status}: ${res.text.slice(0, 800)}`);
+  if (res.status !== 200) {
+    throw smokeError(`${name} non-stream HTTP ${res.status}: ${res.text.slice(0, 800)}`, {
+      status: res.status,
+      rawPreview: compactText(res.text),
+    });
+  }
   assertNoNativeXml(res.text, `${name} non-stream`);
-  const json = JSON.parse(res.text);
+  let json;
+  try {
+    json = JSON.parse(res.text);
+  } catch (error) {
+    throw smokeError(`${name} non-stream invalid JSON: ${error.message}`, {
+      status: res.status,
+      rawPreview: compactText(res.text),
+    });
+  }
   const calls = json.choices?.[0]?.message?.tool_calls || [];
-  return { toolCalls: calls.length, names: assertExpectedTool(calls, name, scenario.choice || '') };
+  const diagnostic = nonStreamDiagnostics(json, res.text, calls);
+  return { toolCalls: calls.length, names: assertExpectedTool(calls, name, scenario.choice || '', diagnostic), diagnostic };
 }
 
 async function runStream(name, scenario) {
@@ -242,10 +320,79 @@ async function runStream(name, scenario) {
     streamEarlyTool,
     expectedTool: scenario.choice || '',
   });
-  if (res.status !== 200) throw new Error(`${name} stream HTTP ${res.status}: ${res.text.slice(0, 800)}`);
+  if (res.status !== 200) {
+    throw smokeError(`${name} stream HTTP ${res.status}: ${res.text.slice(0, 800)}`, {
+      status: res.status,
+      rawPreview: compactText(res.text),
+    });
+  }
   assertNoNativeXml(res.text, `${name} stream`);
   const calls = collectStreamToolCalls(res.text);
-  return { toolCalls: calls.length, names: assertExpectedTool(calls, name, scenario.choice || ''), earlyTool: res.earlyTool, seenDone: !!res.seenDone };
+  const diagnostic = streamDiagnostics(res.text, calls);
+  return {
+    toolCalls: calls.length,
+    names: assertExpectedTool(calls, name, scenario.choice || '', diagnostic),
+    earlyTool: res.earlyTool,
+    seenDone: !!res.seenDone,
+    diagnostic,
+  };
+}
+
+function summarizeLsPool(lsPool) {
+  if (!lsPool || typeof lsPool !== 'object') return null;
+  const pool = lsPool.pool || {};
+  const guard = pool.memoryGuard || lsPool.memoryGuard || {};
+  return {
+    running: !!lsPool.running,
+    maxInstances: lsPool.maxInstances,
+    totalRssBytes: lsPool.totalRssBytes,
+    pool: {
+      size: pool.size,
+      effectiveOccupancy: pool.effectiveOccupancy,
+      pending: pool.pending,
+      reservedPendingStarts: pool.reservedPendingStarts,
+      activeRequests: pool.activeRequests,
+      maintenanceRequests: pool.maintenanceRequests,
+      nonDefaultInstances: pool.nonDefaultInstances,
+      canStartNewNonDefault: pool.canStartNewNonDefault,
+      blockReason: pool.blockReason,
+    },
+    memoryGuard: {
+      enabled: guard.enabled,
+      availableBytes: guard.availableBytes,
+      minAvailableBytes: guard.minAvailableBytes,
+      reservedStarts: guard.reservedStarts,
+      okToSpawn: guard.okToSpawn,
+      minAvailableBytesSource: guard.minAvailableBytesSource,
+    },
+    admissionStats: lsPool.admissionStats || null,
+  };
+}
+
+async function fetchHealthSnapshot(label) {
+  if (!includeHealth) return null;
+  try {
+    const res = await fetch(`${baseUrl}/health?verbose=1`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch {
+      return { ok: false, label, status: res.status, error: 'health returned non-JSON', rawPreview: compactText(text) };
+    }
+    return {
+      ok: res.ok,
+      label,
+      status: res.status,
+      version: json.version,
+      commit: json.commit,
+      accounts: json.accounts,
+      nativeBridge: json.nativeBridge || null,
+      lsPool: summarizeLsPool(json.lsPool),
+    };
+  } catch (error) {
+    return { ok: false, label, error: String(error?.message || error) };
+  }
 }
 
 const selected = expandScenarios(requestedScenarios);
@@ -256,6 +403,7 @@ if (!selected.length) {
 
 const results = {};
 const failures = [];
+const healthBefore = await fetchHealthSnapshot('before');
 for (const name of selected) {
   const scenario = SCENARIOS[name];
   results[name] = {};
@@ -263,7 +411,7 @@ for (const name of selected) {
     try {
       results[name].nonStream = await runNonStream(name, scenario);
     } catch (error) {
-      results[name].nonStream = { ok: false, error: String(error?.message || error) };
+      results[name].nonStream = resultFromError(error);
       failures.push(`${name} non-stream: ${String(error?.message || error)}`);
     }
   }
@@ -271,11 +419,12 @@ for (const name of selected) {
     try {
       results[name].stream = await runStream(name, scenario);
     } catch (error) {
-      results[name].stream = { ok: false, error: String(error?.message || error) };
+      results[name].stream = resultFromError(error);
       failures.push(`${name} stream: ${String(error?.message || error)}`);
     }
   }
 }
+const healthAfter = await fetchHealthSnapshot('after');
 
 console.log(JSON.stringify({
   ok: failures.length === 0,
@@ -286,9 +435,12 @@ console.log(JSON.stringify({
   smokeCwd,
   smokeFile,
   includeEnv,
+  includeHealth,
   streamEarlyTool,
   scenarios: selected,
   results,
   failures,
+  healthBefore,
+  healthAfter,
 }, null, 2));
 if (failures.length && !noExitOnFailure) process.exit(1);
