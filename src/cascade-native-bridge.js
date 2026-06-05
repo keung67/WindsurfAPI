@@ -78,7 +78,7 @@ export const CASCADE_STEP_STATUS_DONE = 3;
 const DEFAULT_NATIVE_BRIDGE_TOOLS = new Set([
   'Read', 'read_file', 'view_file',
   'Bash', 'shell_command', 'run_command',
-  'Grep', 'grep_search', 'grep_search_v2',
+  'Grep', 'grep_v2', 'grep_search', 'grep_search_v2',
   'Glob', 'find',
 ]);
 
@@ -449,6 +449,7 @@ export const TOOL_MAP = {
   // Codex CLI (already speaks cascade-ish vocabulary)
   view_file:       { kind: 'view_file',      forward: identityArgs, reverse: identityArgs },
   run_command:     { kind: 'run_command',    forward: forwardRunCommandPassThrough, reverse: reverseRunCommandPassThrough },
+  grep_v2:         { kind: 'grep_search_v2', forward: identityArgs, reverse: identityArgs },
   grep_search:     { kind: 'grep_search_v2', forward: identityArgs, reverse: identityArgs },
   grep_search_v2:  { kind: 'grep_search_v2', forward: identityArgs, reverse: identityArgs },
   find:            { kind: 'find',           forward: identityArgs, reverse: identityArgs },

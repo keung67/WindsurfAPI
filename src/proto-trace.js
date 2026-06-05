@@ -10,7 +10,7 @@ import { appendFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import { gunzipSync } from 'zlib';
-import { parseFields } from './proto.js';
+import { getAllFields, getField, parseFields } from './proto.js';
 
 let _seq = 0;
 
@@ -52,6 +52,184 @@ function redactPreview(s) {
     .replace(/\b(?:devin-session-token|sessionToken|api[_-]?key|firebase_id_token|idToken|refreshToken)\b\s*[:=]\s*["']?[^"',\s)]+/gi, '<redacted-secret>')
     .replace(/\b[A-Za-z0-9_-]{32,}\b/g, '<redacted-token>')
     .slice(0, 240);
+}
+
+function stringField(fields, num) {
+  const f = getField(fields, num, 2);
+  return f ? f.value.toString('utf8') : '';
+}
+
+function numberField(fields, num) {
+  const f = getField(fields, num, 0);
+  return f ? Number(f.value || 0) : null;
+}
+
+function countRepeatedMessageFields(fields, num) {
+  return getAllFields(fields, num).filter(f => f.wireType === 2).length;
+}
+
+function summarizeNativeToolConfig(toolCfgBuf) {
+  const fields = parseFields(toolCfgBuf);
+  const subconfigFields = [5, 8, 10, 19, 33].filter(num => !!getField(fields, num, 2));
+  return {
+    subconfigFields,
+    allowlist: getAllFields(fields, 32)
+      .filter(f => f.wireType === 2)
+      .map(f => f.value.toString('utf8')),
+  };
+}
+
+function summarizeSendUserCascadeMessage(payload) {
+  const top = parseFields(payload);
+  const out = {
+    cascadeIdHash: null,
+    hasText: !!getField(top, 2, 2),
+    hasMetadata: !!getField(top, 3, 2),
+    imageCount: countRepeatedMessageFields(top, 6),
+    additionalStepCount: countRepeatedMessageFields(top, 9),
+    plannerMode: null,
+    hasNativeToolConfig: false,
+    nativeToolConfig: null,
+  };
+  const cascadeId = stringField(top, 1);
+  if (cascadeId) out.cascadeIdHash = shortHash(Buffer.from(cascadeId, 'utf8'));
+  const cfgField = getField(top, 5, 2);
+  if (!cfgField) return out;
+  const cfg = parseFields(cfgField.value);
+  const plannerField = getField(cfg, 1, 2);
+  if (!plannerField) return out;
+  const planner = parseFields(plannerField.value);
+  const convField = getField(planner, 2, 2);
+  if (convField) {
+    const conv = parseFields(convField.value);
+    out.plannerMode = numberField(conv, 4);
+    out.hasToolCallingSection = !!getField(conv, 10, 2);
+    out.hasAdditionalInstructionsSection = !!getField(conv, 12, 2);
+  }
+  const toolCfgField = getField(planner, 13, 2);
+  if (toolCfgField) {
+    out.hasNativeToolConfig = true;
+    out.nativeToolConfig = summarizeNativeToolConfig(toolCfgField.value);
+  }
+  return out;
+}
+
+const NATIVE_STEP_FIELDS = new Map([
+  [13, 'grep_search'],
+  [14, 'view_file'],
+  [15, 'list_directory'],
+  [23, 'write_to_file'],
+  [28, 'run_command'],
+  [34, 'find'],
+  [40, 'read_url_content'],
+  [42, 'search_web'],
+  [105, 'grep_search_v2'],
+]);
+
+function summarizeNativeStepBody(kind, bodyBuf) {
+  const f = parseFields(bodyBuf);
+  if (kind === 'view_file') {
+    return {
+      absolutePathUriBytes: stringField(f, 1).length,
+      contentBytes: stringField(f, 4).length,
+      offset: numberField(f, 11) || 0,
+      limit: numberField(f, 12) || 0,
+    };
+  }
+  if (kind === 'run_command') {
+    const combined = getField(f, 21, 2);
+    let combinedOutputBytes = 0;
+    if (combined) {
+      try {
+        combinedOutputBytes = stringField(parseFields(combined.value), 1).length;
+      } catch {}
+    }
+    return {
+      commandBytes: (stringField(f, 23) || stringField(f, 1)).length,
+      cwdBytes: stringField(f, 2).length,
+      combinedOutputBytes,
+      stdoutBytes: stringField(f, 4).length,
+      stderrBytes: stringField(f, 5).length,
+    };
+  }
+  if (kind === 'grep_search_v2') {
+    return {
+      patternBytes: stringField(f, 2).length,
+      pathBytes: stringField(f, 3).length,
+      globBytes: stringField(f, 4).length,
+      outputModeBytes: stringField(f, 5).length,
+      headLimit: numberField(f, 12) || 0,
+      rawOutputBytes: stringField(f, 15).length,
+    };
+  }
+  if (kind === 'grep_search') {
+    return {
+      queryBytes: stringField(f, 1).length,
+      searchPathUriBytes: stringField(f, 11).length,
+      resultBytes: stringField(f, 3).length,
+    };
+  }
+  if (kind === 'find') {
+    return {
+      patternBytes: stringField(f, 1).length,
+      searchDirectoryBytes: stringField(f, 10).length,
+      rawOutputBytes: stringField(f, 11).length,
+    };
+  }
+  if (kind === 'list_directory') {
+    return {
+      directoryPathUriBytes: stringField(f, 1).length,
+      childCount: getAllFields(f, 2).filter(x => x.wireType === 2).length,
+    };
+  }
+  return { fieldCount: f.length };
+}
+
+function summarizeTrajectoryStep(stepBuf, index) {
+  const fields = parseFields(stepBuf);
+  const oneofFields = [];
+  for (const [fieldNum, kind] of NATIVE_STEP_FIELDS) {
+    const oneof = getField(fields, fieldNum, 2);
+    if (!oneof) continue;
+    oneofFields.push({
+      field: fieldNum,
+      kind,
+      bodyBytes: oneof.value.length,
+      body: summarizeNativeStepBody(kind, oneof.value),
+    });
+  }
+  return {
+    index,
+    type: numberField(fields, 1),
+    status: numberField(fields, 4),
+    fieldNumbers: fields.map(f => f.field),
+    nativeOneofs: oneofFields,
+  };
+}
+
+function summarizeGetCascadeTrajectorySteps(payload) {
+  const top = parseFields(payload);
+  return {
+    stepCount: countRepeatedMessageFields(top, 1),
+    steps: getAllFields(top, 1)
+      .filter(f => f.wireType === 2)
+      .slice(0, positiveIntEnv('WINDSURFAPI_PROTO_TRACE_SEMANTIC_STEP_LIMIT', 40))
+      .map((f, index) => summarizeTrajectoryStep(f.value, index)),
+  };
+}
+
+function semanticSummary(method, direction, payload) {
+  try {
+    if (method === 'SendUserCascadeMessage' && direction === 'request') {
+      return summarizeSendUserCascadeMessage(payload);
+    }
+    if (method === 'GetCascadeTrajectorySteps' && direction === 'response') {
+      return summarizeGetCascadeTrajectorySteps(payload);
+    }
+  } catch (err) {
+    return { error: err.message };
+  }
+  return null;
 }
 
 function summarizeBytes(buf, depth, maxDepth) {
@@ -139,6 +317,8 @@ export function traceGrpcPayload({ port, path, direction, body, transport = 'grp
       payloadBytes: payload.length,
       payloadSha256: shortHash(payload),
     };
+    const semantic = semanticSummary(record.method, direction, payload);
+    if (semantic) record.semantic = semantic;
     if (payload.length > maxBytes) {
       record.skipped = `payload exceeds ${maxBytes} bytes`;
     } else {

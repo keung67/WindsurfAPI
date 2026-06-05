@@ -193,6 +193,7 @@ describe('native mapped-tool routing', () => {
     const plan = buildToolRoutingPlan([
       fnTool('shell_command'),
       fnTool('read_file'),
+      fnTool('grep_v2'),
       fnTool('grep_search_v2'),
       fnTool('find'),
     ], {
@@ -203,7 +204,7 @@ describe('native mapped-tool routing', () => {
     });
 
     assert.equal(plan.nativeBridgeOn, true);
-    assert.equal(plan.partition.mapped.length, 4);
+    assert.equal(plan.partition.mapped.length, 5);
     assert.equal(plan.partition.unmapped.length, 0);
   });
 

@@ -9,7 +9,17 @@ const nonStreamEnabled = process.env.NATIVE_BRIDGE_SMOKE_NON_STREAM !== '0';
 const requestTimeoutMs = Math.max(5_000, Number(process.env.NATIVE_BRIDGE_SMOKE_TIMEOUT_MS || 120_000));
 const streamEarlyTool = process.env.NATIVE_BRIDGE_SMOKE_EARLY_TOOL !== '0';
 const includeEnv = process.env.NATIVE_BRIDGE_SMOKE_ENV !== '0';
-const smokeCwd = process.env.NATIVE_BRIDGE_SMOKE_CWD || '/tmp/windsurf-workspace';
+async function sha256Hex(text) {
+  const bytes = new TextEncoder().encode(String(text || ''));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+const defaultWorkspaceId = apiKey ? (await sha256Hex(apiKey)).slice(0, 16) : '';
+const defaultSmokeCwd = defaultWorkspaceId
+  ? `/home/user/projects/workspace-${defaultWorkspaceId}`
+  : '/tmp/windsurf-workspace';
+const smokeCwd = process.env.NATIVE_BRIDGE_SMOKE_CWD || defaultSmokeCwd;
 const smokeFile = process.env.NATIVE_BRIDGE_SMOKE_FILE || `${smokeCwd.replace(/\/+$/, '')}/README.md`;
 const requestedScenarios = String(process.env.NATIVE_BRIDGE_SMOKE_TOOLS || 'Bash')
   .split(',')

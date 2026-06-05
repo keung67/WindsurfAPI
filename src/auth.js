@@ -1278,11 +1278,21 @@ export function getAccountList() {
         key: lsAdmission.key,
         wouldStart: lsAdmission.wouldStart,
         poolSize: lsAdmission.poolSize,
+        effectivePoolSize: lsAdmission.effectivePoolSize,
         maxInstances: lsAdmission.maxInstances,
+        pending: !!lsAdmission.pending,
+        poolFull: !!lsAdmission.poolFull,
+        willEvict: !!lsAdmission.willEvict,
+        idleEvictableCount: lsAdmission.idleEvictableCount || 0,
+        evictionCandidateKey: lsAdmission.evictionCandidateKey || null,
         memoryGuard: {
           okToSpawn: lsAdmission.memoryGuard?.okToSpawn ?? null,
           availableBytes: lsAdmission.memoryGuard?.availableBytes ?? null,
           minAvailableBytes: lsAdmission.memoryGuard?.minAvailableBytes ?? null,
+          estimatedRssBytesPerInstance: lsAdmission.memoryGuard?.estimatedRssBytesPerInstance ?? null,
+          observedRssEstimateBytes: lsAdmission.memoryGuard?.observedRssEstimateBytes ?? null,
+          minAvailableBytesSource: lsAdmission.memoryGuard?.minAvailableBytesSource ?? null,
+          reservedStarts: lsAdmission.memoryGuard?.reservedStarts ?? null,
         },
       },
     };
@@ -1926,7 +1936,9 @@ export async function initAuth() {
   // small VPS can exhaust memory before any request arrives.
   const { ensureLs } = await import('./langserver.js');
   const uniqueProxies = new Map();
-  uniqueProxies.set('default', null);
+  if (process.env.LS_PREWARM_DEFAULT !== '0') {
+    uniqueProxies.set('default', null);
+  }
   if (process.env.LS_PREWARM_PROXIES === '1') {
     for (const a of accounts) {
       const p = getEffectiveProxy(a.id);

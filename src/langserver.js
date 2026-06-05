@@ -108,7 +108,11 @@ const MAX_LS_INSTANCES = (() => {
 })();
 const LS_POOL_WAIT_MS = positiveIntEnv('LS_POOL_WAIT_MS', 30_000, 0);
 const LS_MEMORY_GUARD_ENABLED = process.env.LS_MEMORY_GUARD !== '0';
+const LS_SPAWN_MIN_AVAILABLE_BYTES_RAW = String(process.env.LS_SPAWN_MIN_AVAILABLE_BYTES || '').trim();
+const LS_SPAWN_MIN_AVAILABLE_BYTES_EXPLICIT = !!LS_SPAWN_MIN_AVAILABLE_BYTES_RAW;
 const LS_SPAWN_MIN_AVAILABLE_BYTES = bytesEnv('LS_SPAWN_MIN_AVAILABLE_BYTES', DEFAULT_LS_RSS_ESTIMATE_BYTES);
+const LS_OBSERVED_RSS_MIN_BYTES = bytesEnv('LS_OBSERVED_RSS_MIN_BYTES', 384 * 1024 * 1024);
+const LS_OBSERVED_RSS_MARGIN_PERCENT = positiveIntEnv('LS_OBSERVED_RSS_MARGIN_PERCENT', 35, 0);
 
 const LS_IDLE_TTL_MS = (() => {
   const n = parseInt(process.env.LS_IDLE_TTL_MS || '', 10);
@@ -137,6 +141,9 @@ const _pool = new Map();
 // same key share one spawn + readiness wait. Without this, both callers
 // would each spawn an LS process, race on the port, and leave an orphan.
 const _pending = new Map();
+// key -> monotonically increasing admission sequence. These reservations are
+// counted by capacity/memory guards before the LS placeholder reaches _pool.
+const _pendingStartSeq = new Map();
 // Evicted processes are kept as reservations until the OS confirms exit.
 // This prevents transient RSS spikes where old and new LS workers overlap.
 const _stopping = new Map();
@@ -150,6 +157,7 @@ let _binaryPath = DEFAULT_BINARY;
 let _apiServerUrl = DEFAULT_API_URL;
 let _idleSweepTimer = null;
 let _rssSnapshot = { at: 0, pidKey: '', byRootPid: new Map() };
+let _nextPendingStartSeq = 1;
 const _admissionStats = {
   startAttempts: 0,
   startSuccesses: 0,
@@ -424,24 +432,44 @@ function poolOccupancy() {
   return _pool.size + _stopping.size;
 }
 
-function activeSpawnReservationCount(excludeKey = '') {
+function pendingStartReservationCount({ excludeKey = '', beforeSeq = Infinity } = {}) {
+  let count = 0;
+  for (const [key, seq] of _pendingStartSeq) {
+    if (key === excludeKey) continue;
+    if (_pool.has(key)) continue;
+    if (seq < beforeSeq) count++;
+  }
+  return count;
+}
+
+function poolOccupancyWithPendingReservations(opts = {}) {
+  return poolOccupancy() + pendingStartReservationCount(opts);
+}
+
+function activeSpawnReservationCount(opts = {}) {
+  const { excludeKey = '', beforeSeq = Infinity } = typeof opts === 'string'
+    ? { excludeKey: opts, beforeSeq: Infinity }
+    : opts;
   let count = 0;
   for (const [key, entry] of _pool) {
     if (key === excludeKey) continue;
     if (entry && !entry.ready) count++;
   }
-  for (const key of _pending.keys()) {
-    if (key === excludeKey) continue;
-    if (!_pool.has(key)) count++;
-  }
+  count += pendingStartReservationCount({ excludeKey, beforeSeq });
   return count;
+}
+
+export function hasLsPoolCapacityForStart(effectiveOccupancy, maxInstances = MAX_LS_INSTANCES, evictableSlots = 0) {
+  const effective = Math.max(0, Number(effectiveOccupancy) || 0);
+  const max = Math.max(1, Number(maxInstances) || 1);
+  const evictable = Math.max(0, Number(evictableSlots) || 0);
+  return effective < max || effective - evictable < max;
 }
 
 const LS_EVICT_READY_GRACE_MS = positiveIntEnv('LS_EVICT_READY_GRACE_MS', 5000, 0);
 
-function findIdleNonDefaultEvictionCandidate() {
-  let lruKey = null;
-  let lruTime = Infinity;
+function getIdleNonDefaultEvictionCandidates() {
+  const candidates = [];
   const now = Date.now();
   for (const [k, e] of _pool) {
     if (k === 'default') continue;
@@ -449,15 +477,23 @@ function findIdleNonDefaultEvictionCandidate() {
     if ((e.activeRequests || 0) > 0) continue;
     if (e.readyAt && now - e.readyAt < LS_EVICT_READY_GRACE_MS) continue;
     const at = e.lastUsedAt || e._evictAt || e.startedAt || 0;
-    if (at < lruTime) { lruTime = at; lruKey = k; }
+    candidates.push({
+      key: k,
+      entry: e,
+      at,
+      idleMs: e?.lastUsedAt ? Math.max(0, now - e.lastUsedAt) : null,
+    });
   }
-  if (!lruKey) return null;
-  const entry = _pool.get(lruKey);
-  return {
-    key: lruKey,
-    entry,
-    idleMs: entry?.lastUsedAt ? Math.max(0, now - entry.lastUsedAt) : null,
-  };
+  candidates.sort((a, b) => a.at - b.at);
+  return candidates;
+}
+
+function findIdleNonDefaultEvictionCandidate() {
+  return getIdleNonDefaultEvictionCandidates()[0] || null;
+}
+
+function countIdleNonDefaultEvictionCandidates() {
+  return getIdleNonDefaultEvictionCandidates().length;
 }
 
 async function waitProcessExit(proc, timeoutMs) {
@@ -520,23 +556,71 @@ function memoryGuardSnapshot() {
     .filter(n => Number.isFinite(n) && n >= 0);
   return {
     enabled: LS_MEMORY_GUARD_ENABLED,
-    minAvailableBytes: LS_SPAWN_MIN_AVAILABLE_BYTES,
+    configuredMinAvailableBytes: LS_SPAWN_MIN_AVAILABLE_BYTES,
     cgroupAvailableBytes,
     hostAvailableBytes,
     availableBytes: candidates.length ? Math.min(...candidates) : null,
   };
 }
 
+function observedLsRssEstimateBytes(now = Date.now()) {
+  const rssByRootPid = collectTrackedRssSnapshot(now);
+  const samples = [];
+  for (const entry of _pool.values()) {
+    if (!entry?.ready) continue;
+    const pid = entry.process?.pid;
+    const rssBytes = pid ? rssByRootPid.get(pid)?.rssBytes : null;
+    if (Number.isFinite(rssBytes) && rssBytes > 0) samples.push(rssBytes);
+  }
+  if (!samples.length) return null;
+  const maxObserved = Math.max(...samples);
+  const withMargin = Math.ceil(maxObserved * (100 + LS_OBSERVED_RSS_MARGIN_PERCENT) / 100);
+  return Math.max(LS_OBSERVED_RSS_MIN_BYTES, withMargin);
+}
+
+function effectiveLsSpawnEstimate(now = Date.now()) {
+  const observedRssEstimateBytes = observedLsRssEstimateBytes(now);
+  if (LS_SPAWN_MIN_AVAILABLE_BYTES_EXPLICIT) {
+    return {
+      estimateBytes: LS_SPAWN_MIN_AVAILABLE_BYTES,
+      minAvailableBytes: LS_SPAWN_MIN_AVAILABLE_BYTES,
+      source: 'env',
+      observedRssEstimateBytes,
+    };
+  }
+  if (Number.isFinite(observedRssEstimateBytes) && observedRssEstimateBytes > 0) {
+    return {
+      estimateBytes: observedRssEstimateBytes,
+      minAvailableBytes: observedRssEstimateBytes,
+      source: 'observed_rss',
+      observedRssEstimateBytes,
+    };
+  }
+  return {
+    estimateBytes: DEFAULT_LS_RSS_ESTIMATE_BYTES,
+    minAvailableBytes: DEFAULT_LS_RSS_ESTIMATE_BYTES,
+    source: 'default_estimate',
+    observedRssEstimateBytes: null,
+  };
+}
+
 export function getLsMemoryGuardStatus({ reservedStarts = 0 } = {}) {
   const snap = memoryGuardSnapshot();
+  const spawnEstimate = effectiveLsSpawnEstimate();
   const availableBytes = snap.availableBytes == null
     ? null
-    : Math.max(0, snap.availableBytes - (Math.max(0, reservedStarts) * DEFAULT_LS_RSS_ESTIMATE_BYTES));
+    : Math.max(0, snap.availableBytes - (Math.max(0, reservedStarts) * spawnEstimate.estimateBytes));
   return {
     ...snap,
     reservedStarts,
+    minAvailableBytes: spawnEstimate.minAvailableBytes,
+    estimatedRssBytesPerInstance: spawnEstimate.estimateBytes,
+    observedRssEstimateBytes: spawnEstimate.observedRssEstimateBytes,
+    minAvailableBytesSource: spawnEstimate.source,
+    observedRssMinBytes: LS_OBSERVED_RSS_MIN_BYTES,
+    observedRssMarginPercent: LS_OBSERVED_RSS_MARGIN_PERCENT,
     availableBytes,
-    okToSpawn: !snap.enabled || availableBytes == null || availableBytes >= snap.minAvailableBytes,
+    okToSpawn: !snap.enabled || availableBytes == null || availableBytes >= spawnEstimate.minAvailableBytes,
   };
 }
 
@@ -562,9 +646,12 @@ function getLsPoolSummary(now = Date.now()) {
     ageMs: entry?.at ? Math.max(0, now - entry.at) : null,
   }));
   const evictionCandidate = findIdleNonDefaultEvictionCandidate();
+  const evictionCandidateCount = countIdleNonDefaultEvictionCandidates();
   const occupancy = poolOccupancy();
+  const reservedPendingStarts = pendingStartReservationCount();
+  const effectiveOccupancy = occupancy + reservedPendingStarts;
   const memoryGuard = getLsMemoryGuardStatus({ reservedStarts: activeSpawnReservationCount() });
-  const poolHasCapacity = occupancy < MAX_LS_INSTANCES || !!evictionCandidate;
+  const poolHasCapacity = hasLsPoolCapacityForStart(effectiveOccupancy, MAX_LS_INSTANCES, evictionCandidateCount);
   const memoryOk = memoryGuard.okToSpawn || memoryGuard.availableBytes == null || !LS_MEMORY_GUARD_ENABLED;
   const blockReason = !memoryOk
     ? 'memory_guard'
@@ -574,10 +661,12 @@ function getLsPoolSummary(now = Date.now()) {
   return {
     size: _pool.size,
     occupancy,
+    effectiveOccupancy,
     maxInstances: MAX_LS_INSTANCES,
     ready,
     starting,
     pending: _pending.size,
+    reservedPendingStarts,
     pendingKeys,
     stopping: _stopping.size,
     stoppingInstances,
@@ -585,6 +674,7 @@ function getLsPoolSummary(now = Date.now()) {
     nonDefaultInstances,
     defaultRunning,
     idleEvictable: !!evictionCandidate,
+    idleEvictableCount: evictionCandidateCount,
     evictionCandidateKey: evictionCandidate?.key ? publicLsKey(evictionCandidate.key) : null,
     canStartNewNonDefault: !blockReason,
     blockReason,
@@ -597,8 +687,10 @@ export function getLsAdmissionStatus(proxy = null) {
   const existing = _pool.get(key);
   const pending = _pending.has(key);
   const occupancy = poolOccupancy();
+  const effectiveOccupancy = poolOccupancyWithPendingReservations({ excludeKey: key });
   const evictionCandidate = findIdleNonDefaultEvictionCandidate();
-  const memoryGuard = getLsMemoryGuardStatus({ reservedStarts: activeSpawnReservationCount(key) });
+  const evictionCandidateCount = countIdleNonDefaultEvictionCandidates();
+  const memoryGuard = getLsMemoryGuardStatus({ reservedStarts: activeSpawnReservationCount({ excludeKey: key }) });
   if (existing?.ready) {
     return {
       ok: true,
@@ -607,6 +699,7 @@ export function getLsAdmissionStatus(proxy = null) {
       reason: 'already_running',
       key,
       poolSize: occupancy,
+      effectivePoolSize: effectiveOccupancy,
       maxInstances: MAX_LS_INSTANCES,
       pending,
       activeRequests: existing.activeRequests || 0,
@@ -621,6 +714,7 @@ export function getLsAdmissionStatus(proxy = null) {
       reason: 'start_pending',
       key,
       poolSize: occupancy,
+      effectivePoolSize: effectiveOccupancy,
       maxInstances: MAX_LS_INSTANCES,
       pending,
       memoryGuard,
@@ -634,12 +728,13 @@ export function getLsAdmissionStatus(proxy = null) {
       reason: 'memory_guard',
       key,
       poolSize: occupancy,
+      effectivePoolSize: effectiveOccupancy,
       maxInstances: MAX_LS_INSTANCES,
       pending,
       memoryGuard,
     };
   }
-  if (key !== 'default' && occupancy >= MAX_LS_INSTANCES && !evictionCandidate) {
+  if (key !== 'default' && !hasLsPoolCapacityForStart(effectiveOccupancy, MAX_LS_INSTANCES, evictionCandidateCount)) {
     return {
       ok: false,
       wouldStart: true,
@@ -647,6 +742,7 @@ export function getLsAdmissionStatus(proxy = null) {
       reason: 'pool_full_no_idle',
       key,
       poolSize: occupancy,
+      effectivePoolSize: effectiveOccupancy,
       maxInstances: MAX_LS_INSTANCES,
       pending,
       memoryGuard,
@@ -659,30 +755,41 @@ export function getLsAdmissionStatus(proxy = null) {
     reason: 'can_start',
     key,
     poolSize: occupancy,
+    effectivePoolSize: effectiveOccupancy,
     maxInstances: MAX_LS_INSTANCES,
     pending,
-    poolFull: occupancy >= MAX_LS_INSTANCES,
-    willEvict: key !== 'default' && occupancy >= MAX_LS_INSTANCES && !!evictionCandidate,
-    evictionCandidateKey: key !== 'default' && occupancy >= MAX_LS_INSTANCES ? evictionCandidate?.key || null : null,
+    poolFull: effectiveOccupancy >= MAX_LS_INSTANCES,
+    willEvict: key !== 'default' && effectiveOccupancy >= MAX_LS_INSTANCES && !!evictionCandidate,
+    idleEvictableCount: evictionCandidateCount,
+    evictionCandidateKey: key !== 'default' && effectiveOccupancy >= MAX_LS_INSTANCES ? evictionCandidate?.key || null : null,
     memoryGuard,
   };
 }
 
-async function waitForPoolCapacity(key) {
+async function waitForPoolCapacity(key, pendingStartSeq = Infinity) {
   if (key === 'default') return;
   const start = Date.now();
   let logged = false;
-  while (poolOccupancy() >= MAX_LS_INSTANCES) {
-    if (await evictLruIdleNonDefault()) return;
+  while (poolOccupancyWithPendingReservations({ excludeKey: key, beforeSeq: pendingStartSeq }) >= MAX_LS_INSTANCES) {
+    if (await evictLruIdleNonDefault()) continue;
     const remaining = LS_POOL_WAIT_MS - (Date.now() - start);
     if (remaining <= 0) {
       const err = lsPoolExhaustedError(`LS pool at cap (${MAX_LS_INSTANCES}) and no idle non-default instance became evictable within ${LS_POOL_WAIT_MS}ms`);
-      recordAdmissionFailure('pool_capacity', key, err, { poolSize: poolOccupancy(), maxInstances: MAX_LS_INSTANCES });
+      recordAdmissionFailure('pool_capacity', key, err, {
+        poolSize: poolOccupancy(),
+        effectivePoolSize: poolOccupancyWithPendingReservations({ excludeKey: key, beforeSeq: pendingStartSeq }),
+        maxInstances: MAX_LS_INSTANCES,
+      });
       throw err;
     }
     if (!logged) {
       logged = true;
-      recordAdmissionWait('pool_capacity', key, { poolSize: poolOccupancy(), maxInstances: MAX_LS_INSTANCES, waitMs: LS_POOL_WAIT_MS });
+      recordAdmissionWait('pool_capacity', key, {
+        poolSize: poolOccupancy(),
+        effectivePoolSize: poolOccupancyWithPendingReservations({ excludeKey: key, beforeSeq: pendingStartSeq }),
+        maxInstances: MAX_LS_INSTANCES,
+        waitMs: LS_POOL_WAIT_MS,
+      });
       log.info(`LS pool at cap (${MAX_LS_INSTANCES}); waiting up to ${LS_POOL_WAIT_MS}ms for an active non-default instance to go idle`);
     }
     await delay(Math.min(500, remaining));
@@ -691,12 +798,14 @@ async function waitForPoolCapacity(key) {
   }
 }
 
-async function waitForMemoryHeadroom(key) {
+async function waitForMemoryHeadroom(key, pendingStartSeq = Infinity) {
   if (!LS_MEMORY_GUARD_ENABLED || key === 'default') return;
   const start = Date.now();
   let logged = false;
   while (true) {
-    const snap = getLsMemoryGuardStatus({ reservedStarts: activeSpawnReservationCount(key) });
+    const snap = getLsMemoryGuardStatus({
+      reservedStarts: activeSpawnReservationCount({ excludeKey: key, beforeSeq: pendingStartSeq }),
+    });
     if (snap.availableBytes == null || snap.availableBytes >= snap.minAvailableBytes) return;
     const remaining = LS_POOL_WAIT_MS - (Date.now() - start);
     if (remaining <= 0) {
@@ -805,15 +914,17 @@ function collectTrackedRssSnapshot(now = Date.now()) {
 }
 
 function lsStatusConfig() {
+  const memoryGuard = getLsMemoryGuardStatus();
   return {
     maxInstances: MAX_LS_INSTANCES,
     poolWaitMs: LS_POOL_WAIT_MS,
     idleTtlMs: LS_IDLE_TTL_MS,
     idleSweepMs: LS_IDLE_SWEEP_MS,
     estimatedRssBytesPerInstance: DEFAULT_LS_RSS_ESTIMATE_BYTES,
+    effectiveEstimatedRssBytesPerInstance: memoryGuard.estimatedRssBytesPerInstance,
     systemMemoryBytes: totalmem(),
     detectedMemoryLimitBytes: detectMemoryLimitBytes(),
-    memoryGuard: getLsMemoryGuardStatus(),
+    memoryGuard,
   };
 }
 
@@ -964,13 +1075,15 @@ export async function ensureLs(proxy = null) {
   const pending = _pending.get(key);
   if (pending) return pending;
 
+  const pendingStartSeq = _nextPendingStartSeq++;
+  _pendingStartSeq.set(key, pendingStartSeq);
   const promise = (async () => {
     let entry = null;
     let reservedByThisCall = false;
     let attemptedStart = false;
     await withStartAdmissionLock(async () => {
-      await waitForPoolCapacity(key);
-      await waitForMemoryHeadroom(key);
+      await waitForPoolCapacity(key, pendingStartSeq);
+      await waitForMemoryHeadroom(key, pendingStartSeq);
       const nowExisting = _pool.get(key);
       if (nowExisting?.ready) {
         touchEntry(nowExisting);
@@ -1177,6 +1290,7 @@ export async function ensureLs(proxy = null) {
     return await promise;
   } finally {
     _pending.delete(key);
+    _pendingStartSeq.delete(key);
   }
 }
 

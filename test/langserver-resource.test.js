@@ -10,6 +10,7 @@ import {
   estimateDefaultMaxLsInstances,
   classifyLanguageServerStderr,
   getLsStatus,
+  hasLsPoolCapacityForStart,
   sweepIdleLanguageServers,
 } from '../src/langserver.js';
 
@@ -85,17 +86,23 @@ describe('language server resource policy', () => {
     assert.equal(typeof status.idleTtlMs, 'number');
     assert.equal(typeof status.idleSweepMs, 'number');
     assert.equal(status.estimatedRssBytesPerInstance, 700 * 1024 * 1024);
+    assert.equal(typeof status.effectiveEstimatedRssBytesPerInstance, 'number');
     assert.equal(typeof status.systemMemoryBytes, 'number');
     assert.equal(typeof status.detectedMemoryLimitBytes, 'number');
     assert.equal(typeof status.memoryGuard, 'object');
     assert.equal(typeof status.memoryGuard.minAvailableBytes, 'number');
+    assert.equal(typeof status.memoryGuard.estimatedRssBytesPerInstance, 'number');
+    assert.equal(typeof status.memoryGuard.minAvailableBytesSource, 'string');
     assert.equal(typeof status.pool, 'object');
     assert.equal(typeof status.pool.occupancy, 'number');
+    assert.equal(typeof status.pool.effectiveOccupancy, 'number');
     assert.equal(typeof status.pool.ready, 'number');
     assert.equal(typeof status.pool.starting, 'number');
     assert.equal(typeof status.pool.pending, 'number');
+    assert.equal(typeof status.pool.reservedPendingStarts, 'number');
     assert.equal(typeof status.pool.stopping, 'number');
     assert.equal(typeof status.pool.canStartNewNonDefault, 'boolean');
+    assert.equal(typeof status.pool.idleEvictableCount, 'number');
     assert.equal(typeof status.pool.memoryGuard, 'object');
     assert.equal(typeof status.admissionStats, 'object');
     assert.equal(typeof status.admissionStats.startAttempts, 'number');
@@ -119,6 +126,10 @@ describe('language server resource policy', () => {
   test('startup proxy prewarm is opt-in', () => {
     assert.match(AUTH_JS, /uniqueProxies\.set\('default', null\)/);
     assert.match(AUTH_JS, /process\.env\.LS_PREWARM_PROXIES === '1'/);
+  });
+
+  test('auth warmup honors LS_PREWARM_DEFAULT=0 too', () => {
+    assert.match(AUTH_JS, /if \(process\.env\.LS_PREWARM_DEFAULT !== '0'\) \{\s*uniqueProxies\.set\('default', null\);/);
   });
 
   test('default LS startup prewarm can be disabled for low-memory pools', () => {
@@ -162,10 +173,23 @@ describe('language server resource policy', () => {
     const ls = readFileSync(join(__dirname, '..', 'src/langserver.js'), 'utf8');
     assert.match(ls, /function withStartAdmissionLock/);
     assert.match(ls, /poolOccupancy\(\)/);
+    assert.match(ls, /pendingStartReservationCount/);
+    assert.match(ls, /poolOccupancyWithPendingReservations/);
+    assert.match(ls, /countIdleNonDefaultEvictionCandidates/);
+    assert.match(ls, /const _pendingStartSeq = new Map\(\)/);
     assert.match(ls, /const _stopping = new Map\(\)/);
     assert.match(ls, /if \(!e\?\.ready\) continue/);
     assert.match(ls, /await withStartAdmissionLock/);
-    assert.match(ls, /getLsMemoryGuardStatus\(\{ reservedStarts: activeSpawnReservationCount\(key\) \}\)/);
+    assert.match(ls, /activeSpawnReservationCount\(\{ excludeKey: key, beforeSeq: pendingStartSeq \}\)/);
+    assert.match(ls, /poolOccupancyWithPendingReservations\(\{ excludeKey: key, beforeSeq: pendingStartSeq \}\)/);
+  });
+
+  test('LS capacity formula counts pending starts before admitting cold proxies', () => {
+    assert.equal(hasLsPoolCapacityForStart(1, 2, 0), true);
+    assert.equal(hasLsPoolCapacityForStart(2, 2, 0), false);
+    assert.equal(hasLsPoolCapacityForStart(2, 2, 1), true);
+    assert.equal(hasLsPoolCapacityForStart(3, 2, 1), false);
+    assert.equal(hasLsPoolCapacityForStart(3, 2, 2), true);
   });
 
   test('LS status includes admission telemetry for health and dashboard', () => {
@@ -184,5 +208,7 @@ describe('language server resource policy', () => {
     assert.match(ls, /_u_redacted/);
     assert.match(ls, /pendingKeys = Array\.from\(_pending\.keys\(\)\)\.map\(publicLsKey\)/);
     assert.match(ls, /evictionCandidateKey: evictionCandidate\?\.key \? publicLsKey\(evictionCandidate\.key\) : null/);
+    assert.match(AUTH_JS, /effectivePoolSize: lsAdmission\.effectivePoolSize/);
+    assert.match(AUTH_JS, /estimatedRssBytesPerInstance: lsAdmission\.memoryGuard\?\.estimatedRssBytesPerInstance/);
   });
 });

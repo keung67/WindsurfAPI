@@ -13,7 +13,7 @@
  * and the dashboard can filter/group by ctx fields.
  */
 
-import { mkdirSync, createWriteStream, existsSync } from 'fs';
+import { mkdirSync, createWriteStream } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { config, log } from '../config.js';
@@ -35,13 +35,32 @@ function today() {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
+function createLogStream(file) {
+  const stream = createWriteStream(file, { flags: 'a' });
+  stream._windsurfLogFailed = false;
+  stream.on('error', () => {
+    stream._windsurfLogFailed = true;
+    try { stream.destroy(); } catch {}
+  });
+  return stream;
+}
+
+function writeLogLine(stream, line) {
+  if (!stream || stream.destroyed || stream._windsurfLogFailed) return;
+  try { stream.write(line); } catch {}
+}
+
+function needsNewStream(stream) {
+  return !stream || stream.destroyed || stream._windsurfLogFailed;
+}
+
 function getStreams() {
   const date = today();
-  if (date !== _streamDate) {
+  if (date !== _streamDate || needsNewStream(_appStream) || needsNewStream(_errStream)) {
     try { _appStream?.end(); } catch {}
     try { _errStream?.end(); } catch {}
-    _appStream = createWriteStream(join(LOG_DIR, `app-${date}.jsonl`), { flags: 'a' });
-    _errStream = createWriteStream(join(LOG_DIR, `error-${date}.jsonl`), { flags: 'a' });
+    _appStream = createLogStream(join(LOG_DIR, `app-${date}.jsonl`));
+    _errStream = createLogStream(join(LOG_DIR, `error-${date}.jsonl`));
     _streamDate = date;
   }
   return { app: _appStream, err: _errStream };
@@ -91,8 +110,8 @@ for (const level of ['debug', 'info', 'warn', 'error']) {
     try {
       const { app, err } = getStreams();
       const line = JSON.stringify(entry) + '\n';
-      app.write(line);
-      if (level === 'error' || level === 'warn') err.write(line);
+      writeLogLine(app, line);
+      if (level === 'error' || level === 'warn') writeLogLine(err, line);
     } catch {}
 
     // Also print to console so pm2 logs still work

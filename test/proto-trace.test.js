@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 import { grpcFrame } from '../src/grpc.js';
 import { writeMessageField, writeStringField, writeVarintField } from '../src/proto.js';
+import { buildSendCascadeMessageRequest } from '../src/windsurf.js';
 import {
   _resetProtoTraceForTests,
   summarizeProtoForTrace,
@@ -71,5 +72,69 @@ describe('proto trace', () => {
     assert.equal(rec.method, 'GetUserStatus');
     assert.equal(rec.fields[0].type, 'string');
     assert.ok(!line.includes('super-secret-token-value'));
+  });
+
+  it('adds semantic SendUserCascadeMessage native tool config summaries', () => {
+    process.env.WINDSURFAPI_PROTO_TRACE = '1';
+    const proto = buildSendCascadeMessageRequest('k', 'cid', 'hi', 12345, 'MODEL_TEST', 'sess', {
+      nativeMode: true,
+      nativeAllowlist: ['read_file', 'run_command', 'grep_v2', 'list_dir'],
+      additionalSteps: [
+        Buffer.concat([
+          writeVarintField(1, 28),
+          writeVarintField(4, 3),
+          writeMessageField(28, writeStringField(23, 'printf test')),
+        ]),
+      ],
+    });
+    traceGrpcPayload({
+      port: 42100,
+      path: '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
+      direction: 'request',
+      body: grpcFrame(proto),
+      transport: 'grpc',
+      framed: true,
+    });
+
+    const file = join(dir, `ls-proto-${process.pid}-SendUserCascadeMessage.jsonl`);
+    const rec = JSON.parse(readFileSync(file, 'utf8').trim());
+    assert.equal(rec.semantic.plannerMode, 1);
+    assert.equal(rec.semantic.additionalStepCount, 1);
+    assert.equal(rec.semantic.hasNativeToolConfig, true);
+    assert.deepEqual(rec.semantic.nativeToolConfig.allowlist, ['read_file', 'run_command', 'grep_v2', 'list_dir']);
+    assert.deepEqual(rec.semantic.nativeToolConfig.subconfigFields.sort((a, b) => a - b), [8, 10, 19, 33]);
+  });
+
+  it('adds semantic GetCascadeTrajectorySteps native oneof summaries', () => {
+    process.env.WINDSURFAPI_PROTO_TRACE = '1';
+    const grepBody = Buffer.concat([
+      writeStringField(2, 'Proxy workspace placeholder'),
+      writeStringField(3, '/home/user/projects/workspace-test'),
+      writeStringField(4, 'README.md'),
+      writeStringField(15, 'README.md\n'),
+    ]);
+    const step = Buffer.concat([
+      writeVarintField(1, 105),
+      writeVarintField(4, 3),
+      writeMessageField(105, grepBody),
+    ]);
+    const response = writeMessageField(1, step);
+    traceGrpcPayload({
+      port: 42100,
+      path: '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps',
+      direction: 'response',
+      body: response,
+      transport: 'grpc',
+      framed: false,
+    });
+
+    const file = join(dir, `ls-proto-${process.pid}-GetCascadeTrajectorySteps.jsonl`);
+    const rec = JSON.parse(readFileSync(file, 'utf8').trim());
+    assert.equal(rec.semantic.stepCount, 1);
+    assert.equal(rec.semantic.steps[0].type, 105);
+    assert.equal(rec.semantic.steps[0].status, 3);
+    assert.equal(rec.semantic.steps[0].nativeOneofs[0].field, 105);
+    assert.equal(rec.semantic.steps[0].nativeOneofs[0].kind, 'grep_search_v2');
+    assert.equal(rec.semantic.steps[0].nativeOneofs[0].body.rawOutputBytes, 'README.md\n'.length);
   });
 });
