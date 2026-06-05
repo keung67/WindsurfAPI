@@ -128,11 +128,13 @@ async function route(req, res) {
         const { getLsStatus } = await import('./langserver.js');
         const { getSpecialAgentStatus } = await import('./special-agent.js');
         const { getNativeBridgeStats } = await import('./native-bridge-stats.js');
+        const { getNativeBridgeConfigStatus } = await import('./cascade-native-bridge.js');
         body.conversationPool = poolStats();
         body.cache = cacheStats();
         body.lsPool = getLsStatus();
         body.specialAgent = getSpecialAgentStatus();
         body.nativeBridge = getNativeBridgeStats();
+        body.nativeBridgeConfig = getNativeBridgeConfigStatus();
         // v2.0.57 Fix 5 — drought summary so monitoring can page on
         // "all accounts < 5% weekly" without screen-scraping per-account
         // credit dumps.

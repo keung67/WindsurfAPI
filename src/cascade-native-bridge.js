@@ -113,6 +113,22 @@ function csvListEnv(name) {
     .filter(Boolean);
 }
 
+export function getNativeBridgeConfigStatus() {
+  return {
+    mode: String(process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE || '').trim(),
+    off: process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF === '1',
+    tools: csvListEnv('WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS'),
+    models: csvListEnv('WINDSURFAPI_NATIVE_TOOL_BRIDGE_MODELS'),
+    providers: csvListEnv('WINDSURFAPI_NATIVE_TOOL_BRIDGE_PROVIDERS'),
+    routes: csvListEnv('WINDSURFAPI_NATIVE_TOOL_BRIDGE_ROUTES'),
+    callers: csvListEnv('WINDSURFAPI_NATIVE_TOOL_BRIDGE_CALLERS'),
+    allowlistNameOverrides: csvListEnv('WINDSURFAPI_NATIVE_TOOL_BRIDGE_ALLOWLIST_NAMES'),
+    hasApiKeyGate: csvListEnv('WINDSURFAPI_NATIVE_TOOL_BRIDGE_API_KEYS').length > 0,
+    hasAccountGate: csvListEnv('WINDSURFAPI_NATIVE_TOOL_BRIDGE_ACCOUNTS').length > 0,
+    hasRawConfig: !!String(process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CONFIG_RAW || '').trim(),
+  };
+}
+
 function patternMatches(pattern, value, caseInsensitive = false) {
   if (!pattern || !value) return false;
   const p = caseInsensitive ? String(pattern).toLowerCase() : String(pattern);

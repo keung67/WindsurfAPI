@@ -39,6 +39,74 @@ async function withMockServer(handler, fn) {
 }
 
 describe('native bridge smoke CLI', () => {
+  it('refuses to run scenarios when native bridge is not enabled', async () => {
+    let healthHits = 0;
+    let chatHits = 0;
+    await withMockServer((req, res) => {
+      if (req.url?.startsWith('/health')) {
+        healthHits++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'ok',
+          version: 'test-version',
+          commit: 'test-commit',
+          accounts: { total: 1, active: 1, error: 0 },
+          nativeBridge: { requests: 0, emittedByTool: {}, byCascadeKind: {} },
+          nativeBridgeConfig: {
+            mode: '',
+            off: false,
+            tools: [],
+            models: [],
+            hasApiKeyGate: false,
+            hasAccountGate: false,
+            hasRawConfig: false,
+          },
+          lsPool: {
+            running: true,
+            pool: {
+              activeRequests: 0,
+              maintenanceRequests: 0,
+              pending: 0,
+              reservedPendingStarts: 0,
+              canStartNewNonDefault: true,
+            },
+          },
+        }));
+        return;
+      }
+
+      if (req.url === '/v1/chat/completions' && req.method === 'POST') {
+        chatHits++;
+        req.resume();
+        res.writeHead(500);
+        res.end('chat should not be called');
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    }, async (baseUrl) => {
+      const result = await runNodeScript(join(root, 'scripts', 'native-bridge-smoke.mjs'), {
+        API_KEY: 'test-key',
+        BASE_URL: baseUrl,
+        MODEL: 'claude-test',
+        NATIVE_BRIDGE_SMOKE_TOOLS: 'Bash',
+        NATIVE_BRIDGE_SMOKE_STREAM: '1',
+        NATIVE_BRIDGE_SMOKE_NON_STREAM: '0',
+        NATIVE_BRIDGE_SMOKE_NO_EXIT_ON_FAILURE: '1',
+        NATIVE_BRIDGE_SMOKE_TIMEOUT_MS: '5000',
+      });
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(chatHits, 0);
+      assert.equal(healthHits, 2);
+      const json = JSON.parse(result.stdout);
+      assert.equal(json.ok, false);
+      assert.equal(json.requireNativeBridgeEnabled, true);
+      assert.match(json.results.preflight.diagnostic.reason, /native_bridge_not_enabled/);
+    });
+  });
+
   it('refuses to run scenarios when LS budget preflight is busy', async () => {
     let healthHits = 0;
     let chatHits = 0;
@@ -52,6 +120,7 @@ describe('native bridge smoke CLI', () => {
           commit: 'test-commit',
           accounts: { total: 1, active: 1, error: 0 },
           nativeBridge: { requests: 0, emittedByTool: {}, byCascadeKind: {} },
+          nativeBridgeConfig: { mode: 'all_mapped', off: false },
           lsPool: {
             running: true,
             maxInstances: 2,
@@ -125,6 +194,7 @@ describe('native bridge smoke CLI', () => {
             requestedByTool: { Read: 1 },
             emittedByTool: {},
           },
+          nativeBridgeConfig: { mode: 'all_mapped', off: false },
           lsPool: {
             running: true,
             maxInstances: 2,
@@ -212,6 +282,7 @@ describe('native bridge smoke CLI', () => {
           commit: 'test-commit',
           accounts: { total: 1, active: 1, error: 0 },
           nativeBridge: { requests: 1, emittedByTool: {}, byCascadeKind: {} },
+          nativeBridgeConfig: { mode: 'all_mapped', off: false },
           lsPool: { running: true, pool: {}, memoryGuard: {} },
         }));
         return;
@@ -261,6 +332,7 @@ describe('native bridge smoke CLI', () => {
           commit: 'test-commit',
           accounts: { total: 1, active: 1, error: 0 },
           nativeBridge: { requests: 1, emittedByTool: { Glob: 1 }, byCascadeKind: { list_directory: 1 } },
+          nativeBridgeConfig: { mode: 'all_mapped', off: false },
           lsPool: { running: true, pool: {}, memoryGuard: {} },
         }));
         return;

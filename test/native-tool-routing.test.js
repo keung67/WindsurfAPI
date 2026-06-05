@@ -14,6 +14,7 @@ import {
 import {
   buildReverseLookup,
   decodeCascadeStepToToolCall,
+  getNativeBridgeConfigStatus,
   nativeAllowlistNameForTool,
 } from '../src/cascade-native-bridge.js';
 import {
@@ -36,10 +37,13 @@ const originalNativeBridge = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
 const originalNativeBridgeOff = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
 const originalNativeBridgeTools = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
 const originalNativeBridgeModels = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_MODELS;
+const originalNativeBridgeProviders = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_PROVIDERS;
+const originalNativeBridgeRoutes = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ROUTES;
 const originalNativeBridgeCallers = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CALLERS;
 const originalNativeBridgeApiKeys = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_API_KEYS;
 const originalNativeBridgeAccounts = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ACCOUNTS;
 const originalNativeBridgeAllowlistNames = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ALLOWLIST_NAMES;
+const originalNativeBridgeRawConfig = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CONFIG_RAW;
 
 afterEach(() => {
   if (originalNativeBridge === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
@@ -50,6 +54,10 @@ afterEach(() => {
   else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = originalNativeBridgeTools;
   if (originalNativeBridgeModels === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_MODELS;
   else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_MODELS = originalNativeBridgeModels;
+  if (originalNativeBridgeProviders === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_PROVIDERS;
+  else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_PROVIDERS = originalNativeBridgeProviders;
+  if (originalNativeBridgeRoutes === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ROUTES;
+  else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ROUTES = originalNativeBridgeRoutes;
   if (originalNativeBridgeCallers === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CALLERS;
   else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CALLERS = originalNativeBridgeCallers;
   if (originalNativeBridgeApiKeys === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_API_KEYS;
@@ -58,6 +66,8 @@ afterEach(() => {
   else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ACCOUNTS = originalNativeBridgeAccounts;
   if (originalNativeBridgeAllowlistNames === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ALLOWLIST_NAMES;
   else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ALLOWLIST_NAMES = originalNativeBridgeAllowlistNames;
+  if (originalNativeBridgeRawConfig === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CONFIG_RAW;
+  else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CONFIG_RAW = originalNativeBridgeRawConfig;
   while (createdAccountIds.length) {
     removeAccount(createdAccountIds.pop());
   }
@@ -96,6 +106,37 @@ function parseChatFrames(raw) {
       return payload === '[DONE]' ? '[DONE]' : JSON.parse(payload);
     });
 }
+
+describe('native bridge config status', () => {
+  it('summarizes gates without exposing API keys or account values', () => {
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = 'all_mapped';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF = '0';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read,Bash';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_MODELS = 'claude-4.5-haiku';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_PROVIDERS = 'anthropic';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ROUTES = 'chat';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CALLERS = 'caller-a';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_API_KEYS = 'secret-key';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ACCOUNTS = 'secret-account';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ALLOWLIST_NAMES = 'Read:read_file';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CONFIG_RAW = 'read_file:7801';
+
+    const status = getNativeBridgeConfigStatus();
+    assert.equal(status.mode, 'all_mapped');
+    assert.equal(status.off, false);
+    assert.deepEqual(status.tools, ['Read', 'Bash']);
+    assert.deepEqual(status.models, ['claude-4.5-haiku']);
+    assert.deepEqual(status.providers, ['anthropic']);
+    assert.deepEqual(status.routes, ['chat']);
+    assert.deepEqual(status.callers, ['caller-a']);
+    assert.deepEqual(status.allowlistNameOverrides, ['Read:read_file']);
+    assert.equal(status.hasApiKeyGate, true);
+    assert.equal(status.hasAccountGate, true);
+    assert.equal(status.hasRawConfig, true);
+    assert.equal(JSON.stringify(status).includes('secret-key'), false);
+    assert.equal(JSON.stringify(status).includes('secret-account'), false);
+  });
+});
 
 describe('native mapped-tool routing', () => {
   it('all_mapped mode routes Read/Bash/Grep/Glob through native bridge only', () => {

@@ -14,6 +14,7 @@ const includeHealth = process.env.NATIVE_BRIDGE_SMOKE_HEALTH !== '0';
 const requireNativeBridgeTool = process.env.NATIVE_BRIDGE_SMOKE_REQUIRE_NATIVE !== '0';
 const validateToolArgs = process.env.NATIVE_BRIDGE_SMOKE_VALIDATE_ARGS !== '0';
 const enforceLsBudget = process.env.NATIVE_BRIDGE_SMOKE_LS_BUDGET !== '0';
+const requireNativeBridgeEnabled = process.env.NATIVE_BRIDGE_SMOKE_REQUIRE_BRIDGE_ENABLED !== '0';
 async function sha256Hex(text) {
   const bytes = new TextEncoder().encode(String(text || ''));
   const digest = await crypto.subtle.digest('SHA-256', bytes);
@@ -469,6 +470,7 @@ async function fetchHealthSnapshot(label) {
       commit: json.commit,
       accounts: json.accounts,
       nativeBridge: json.nativeBridge || null,
+      nativeBridgeConfig: json.nativeBridgeConfig || null,
       lsPool: summarizeLsPool(json.lsPool),
     };
   } catch (error) {
@@ -480,6 +482,12 @@ function lsBudgetBlockReason(health) {
   if (!enforceLsBudget || !includeHealth) return null;
   if (!health) return 'health_unavailable';
   if (health.ok === false) return `health_${health.status || 'failed'}`;
+  if (requireNativeBridgeEnabled) {
+    if (!health.nativeBridgeConfig) return 'native_bridge_config_unavailable';
+    const cfg = health.nativeBridgeConfig;
+    if (cfg.off) return 'native_bridge_off';
+    if (!String(cfg.mode || '').trim()) return 'native_bridge_not_enabled';
+  }
   const pool = health.lsPool?.pool;
   if (!pool || typeof pool !== 'object') return null;
   const busy = [];
@@ -551,6 +559,7 @@ console.log(JSON.stringify({
   includeEnv,
   includeHealth,
   enforceLsBudget,
+  requireNativeBridgeEnabled,
   requireNativeBridgeTool,
   validateToolArgs,
   streamEarlyTool,
