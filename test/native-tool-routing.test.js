@@ -209,7 +209,8 @@ describe('native mapped-tool routing', () => {
 
   it('can override Cascade allowlist names for proto matrix experiments only', () => {
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ALLOWLIST_NAMES;
-    assert.equal(nativeAllowlistNameForTool('Read'), 'view_file');
+    assert.equal(nativeAllowlistNameForTool('Read'), 'read_file');
+    assert.equal(nativeAllowlistNameForTool('view_file'), 'read_file');
     assert.equal(nativeAllowlistNameForTool('Grep'), 'grep_search_v2');
     assert.equal(nativeAllowlistNameForTool('Glob'), 'find');
 

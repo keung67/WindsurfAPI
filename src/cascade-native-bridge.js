@@ -616,7 +616,10 @@ export function nativeAllowlistNameForTool(toolName) {
   const entry = TOOL_MAP[name];
   if (!entry) return '';
   const overrides = nativeAllowlistNameOverrides();
-  return overrides.get(name) || overrides.get(entry.kind) || entry.kind;
+  if (overrides.has(name)) return overrides.get(name);
+  if (overrides.has(entry.kind)) return overrides.get(entry.kind);
+  if (entry.kind === 'view_file') return 'read_file';
+  return entry.kind;
 }
 
 // ─── Forward: build cascade trajectory step proto ───────────────────
