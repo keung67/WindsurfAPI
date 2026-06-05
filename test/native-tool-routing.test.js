@@ -158,6 +158,7 @@ describe('native mapped-tool routing', () => {
     });
     assert.equal(nonePlan.nativeBridgeOn, false);
 
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read';
     const forcedPlan = buildToolRoutingPlan(effectiveToolsForToolChoice(tools, { type: 'function', function: { name: 'Read' } }), {
       useCascade: true,
       modelKey: 'claude-sonnet-4.6',
@@ -168,8 +169,31 @@ describe('native mapped-tool routing', () => {
     assert.deepEqual(forcedPlan.nativeCallerTools.map(t => t.function.name), ['Read']);
   });
 
-  it('all_mapped mode routes Read/Bash/Grep/Glob through native bridge only', () => {
+  it('defaults native bridge production canaries to Bash/run_command only', () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = 'all_mapped';
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
+
+    const plan = buildToolRoutingPlan([
+      fnTool('Read'),
+      fnTool('Bash'),
+      fnTool('Grep'),
+      fnTool('Glob'),
+    ], {
+      useCascade: true,
+      modelKey: 'claude-sonnet-4.6',
+      provider: 'anthropic',
+      route: 'chat',
+    });
+
+    assert.equal(plan.nativeBridgeOn, false);
+    assert.deepEqual(plan.partition.mapped.map(t => t.function.name), ['Bash']);
+    assert.deepEqual(plan.partition.unmapped.map(t => t.function.name), ['Read', 'Grep', 'Glob']);
+  });
+
+  it('explicit native tool allowlist can opt Read/Grep/Glob into protocol matrix canaries', () => {
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = 'all_mapped';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read,Bash,Grep,Glob';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
 
     const plan = buildToolRoutingPlan([
@@ -199,8 +223,9 @@ describe('native mapped-tool routing', () => {
     assert.equal(preamble.tier, 'empty');
   });
 
-  it('keeps WebSearch/WebFetch on emulation by default', () => {
+  it('keeps Read/WebSearch/WebFetch on emulation by default when only Bash is mature', () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = '1';
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
 
     const plan = buildToolRoutingPlan([
@@ -214,13 +239,13 @@ describe('native mapped-tool routing', () => {
       route: 'chat',
     });
 
-    assert.equal(plan.nativeBridgeOn, true);
-    assert.deepEqual(plan.partition.mapped.map(t => t.function.name), ['Read']);
-    assert.deepEqual(plan.partition.unmapped.map(t => t.function.name), ['WebSearch', 'WebFetch']);
-    assert.deepEqual(plan.emulationTools.map(t => t.function.name), ['WebSearch', 'WebFetch']);
+    assert.equal(plan.nativeBridgeOn, false);
+    assert.deepEqual(plan.partition.mapped.map(t => t.function.name), []);
+    assert.deepEqual(plan.partition.unmapped.map(t => t.function.name), ['Read', 'WebSearch', 'WebFetch']);
+    assert.deepEqual(plan.emulationTools.map(t => t.function.name), ['Read', 'WebSearch', 'WebFetch']);
   });
 
-  it('keeps edit/write/web tools out of native bridge unless explicitly allowlisted', () => {
+  it('keeps read/edit/write/web tools out of native bridge unless explicitly allowlisted', () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = '1';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
@@ -239,9 +264,9 @@ describe('native mapped-tool routing', () => {
       route: 'chat',
     });
 
-    assert.equal(plan.nativeBridgeOn, true);
-    assert.deepEqual(plan.partition.mapped.map(t => t.function.name), ['Read']);
-    assert.deepEqual(plan.partition.unmapped.map(t => t.function.name), ['Write', 'Edit', 'MultiEdit', 'WebSearch', 'WebFetch']);
+    assert.equal(plan.nativeBridgeOn, false);
+    assert.deepEqual(plan.partition.mapped.map(t => t.function.name), []);
+    assert.deepEqual(plan.partition.unmapped.map(t => t.function.name), ['Read', 'Write', 'Edit', 'MultiEdit', 'WebSearch', 'WebFetch']);
   });
 
   it('explicit native tool allowlist can opt WebSearch/WebFetch into native bridge', () => {
@@ -265,8 +290,9 @@ describe('native mapped-tool routing', () => {
     assert.deepEqual(plan.partition.unmapped, []);
   });
 
-  it('keeps shell/read/grep/find aliases in the default native scope', () => {
+  it('keeps only shell aliases in the default native scope', () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = 'all_mapped';
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
 
     const plan = buildToolRoutingPlan([
@@ -282,9 +308,9 @@ describe('native mapped-tool routing', () => {
       route: 'chat',
     });
 
-    assert.equal(plan.nativeBridgeOn, true);
-    assert.equal(plan.partition.mapped.length, 5);
-    assert.equal(plan.partition.unmapped.length, 0);
+    assert.equal(plan.nativeBridgeOn, false);
+    assert.deepEqual(plan.partition.mapped.map(t => t.function.name), ['shell_command']);
+    assert.deepEqual(plan.partition.unmapped.map(t => t.function.name), ['read_file', 'grep_v2', 'grep_search_v2', 'find']);
   });
 
   it('can override Cascade allowlist names for proto matrix experiments only', () => {
@@ -327,6 +353,7 @@ describe('native mapped-tool routing', () => {
 
   it('all_mapped mode refuses mixed toolsets so unmapped tools still get prompt emulation', () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = 'all_mapped';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read,Bash';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
 
     const plan = buildToolRoutingPlan([
@@ -349,6 +376,7 @@ describe('native mapped-tool routing', () => {
 
   it('force mode keeps partition behavior: mapped native plus unmapped preamble', () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = '1';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
 
     const plan = buildToolRoutingPlan([
@@ -370,6 +398,7 @@ describe('native mapped-tool routing', () => {
 
   it('honors model and caller gray gates before enabling native bridge', () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = '1';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read';
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_MODELS = 'claude-sonnet-4.6';
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CALLERS = 'caller-allowed';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
@@ -404,6 +433,7 @@ describe('native mapped-tool routing', () => {
 
   it('requires the API-key sentinel when API key gray gate is configured', () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = '1';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read';
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_API_KEYS = 'sk-test';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
 
@@ -428,6 +458,7 @@ describe('native mapped-tool routing', () => {
 
   it('matches caller gray gate even when API-key sentinel is appended', () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = '1';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read';
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_API_KEYS = 'sk-test';
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_CALLERS = 'api:hash';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
@@ -444,6 +475,7 @@ describe('native mapped-tool routing', () => {
 
   it('fails fast when native account gate has no active match', async () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = '1';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read';
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ACCOUNTS = 'missing@example.com';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
 
@@ -460,6 +492,7 @@ describe('native mapped-tool routing', () => {
 
   it('skips non-allowlisted accounts before starting LS in native mode', async () => {
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = '1';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read';
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ACCOUNTS = 'allowed@example.com';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
     const seen = [];
@@ -508,6 +541,7 @@ describe('native mapped-tool routing', () => {
   it('stream native bridge converts provider-native XML before content is emitted', async () => {
     resetNativeBridgeStats();
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = 'all_mapped';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
     const account = addAccountByKey(`native-stream-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'native-stream');
     createdAccountIds.push(account.id);
@@ -568,6 +602,7 @@ describe('native mapped-tool routing', () => {
   it('stream native bridge filters cascade tool calls through forced tool_choice', async () => {
     resetNativeBridgeStats();
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = 'all_mapped';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read,Bash';
     delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
     const account = addAccountByKey(`native-choice-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'native-choice');
     createdAccountIds.push(account.id);

@@ -37,12 +37,8 @@ describe('upstream-timeout cascade invalidation (#101)', () => {
     const m = CHAT_JS.match(/lastErr = err;\s+reuseEntry = null;[\s\S]{0,1500}?const isAuthFail = /);
     assert.ok(m, 'stream catch block region not found — refactor may have changed shape');
     const region = m[0];
-    assert.match(region, /context deadline exceeded/i,
-      'stream timeout regex must mention "context deadline exceeded"');
-    assert.match(region, /context cancellation while reading body/i,
-      'stream timeout regex must mention "context cancellation while reading body"');
-    assert.match(region, /client\\?\.timeout/i,
-      'stream timeout regex must include Client.Timeout fallback');
+    assert.match(region, /isUpstreamDeadlineExceeded\(err\)/,
+      'stream timeout branch must use the shared upstream deadline classifier');
     assert.match(region, /reuseEntryDead = true/,
       'stream timeout branch must set reuseEntryDead = true');
   });
@@ -56,10 +52,18 @@ describe('upstream-timeout cascade invalidation (#101)', () => {
     const m = CHAT_JS.match(/if \(result\.reuseEntryInvalid\) reuseEntryDead = true;[\s\S]{0,800}?lastErr = result;/);
     assert.ok(m, 'non-stream invalidation region not found — refactor may have changed shape');
     const region = m[0];
-    assert.match(region, /context deadline exceeded/i);
-    assert.match(region, /context cancellation while reading body/i);
-    assert.match(region, /client\\?\.timeout/i);
+    assert.match(region, /isUpstreamDeadlineExceeded\(_resultMsg\)/,
+      'non-stream timeout branch must use the shared upstream deadline classifier');
     assert.match(region, /reuseEntryDead = true/);
+  });
+
+  test('shared classifier keeps all upstream deadline patterns', () => {
+    const m = CHAT_JS.match(/const UPSTREAM_DEADLINE_RE = ([^\n;]+);/);
+    assert.ok(m, 'shared upstream deadline regex not found');
+    const pattern = m[1];
+    assert.match(pattern, /context deadline exceeded/i);
+    assert.match(pattern, /context cancellation while reading body/i);
+    assert.match(pattern, /client\\?\.timeout/i);
   });
 
   test('regex actually matches the user-reported error message verbatim', () => {

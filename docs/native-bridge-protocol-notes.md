@@ -3,6 +3,17 @@
 Status: reverse-engineering notes for the opt-in native bridge. Nothing here
 is a default production enablement decision.
 
+## Production Gate Status
+
+Default production canary scope is intentionally limited to
+`Bash` / `shell_command` / `run_command`.
+
+`Read`, `Grep`, and `Glob` stay in `TOOL_MAP` for protocol matrix testing, but
+they are not in the default native bridge tool allowlist. To test them, set
+`WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS=Read,Bash,Grep,Glob` or a narrower list
+for a gated account/API key/model. Do not treat successful protobuf
+encode/decode round-trips as production readiness.
+
 ## Confirmed Tool Config Fields
 
 `CascadeToolConfig`:

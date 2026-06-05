@@ -34,8 +34,16 @@ import {
 const fnTool = (name) => ({ type: 'function', function: { name, parameters: { type: 'object' } } });
 
 describe('canMapAllTools', () => {
-  it('admits a homogeneous mapped set', () => {
-    assert.equal(canMapAllTools([fnTool('Read'), fnTool('Bash'), fnTool('Glob')]), true);
+  it('admits only mature default-native tools without an explicit tool allowlist', () => {
+    const prev = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+    try {
+      assert.equal(canMapAllTools([fnTool('Bash'), fnTool('shell_command'), fnTool('run_command')]), true);
+      assert.equal(canMapAllTools([fnTool('Read'), fnTool('Bash'), fnTool('Glob')]), false);
+    } finally {
+      if (prev === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+      else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = prev;
+    }
   });
 
   it('rejects when ANY tool is unmapped', () => {
@@ -48,12 +56,29 @@ describe('canMapAllTools', () => {
     assert.equal(canMapAllTools(undefined), false);
   });
 
-  it('admits Codex-style cascade-native names', () => {
-    assert.equal(canMapAllTools([fnTool('view_file'), fnTool('run_command'), fnTool('find')]), true);
+  it('admits Codex-style command names by default and other native names only when allowlisted', () => {
+    const prev = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+    try {
+      assert.equal(canMapAllTools([fnTool('run_command')]), true);
+      assert.equal(canMapAllTools([fnTool('view_file'), fnTool('run_command'), fnTool('find')]), false);
+      process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'view_file,run_command,find';
+      assert.equal(canMapAllTools([fnTool('view_file'), fnTool('run_command'), fnTool('find')]), true);
+    } finally {
+      if (prev === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+      else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = prev;
+    }
   });
 
-  it('admits mixed Claude Code + Codex names', () => {
-    assert.equal(canMapAllTools([fnTool('Read'), fnTool('run_command'), fnTool('Grep')]), true);
+  it('admits mixed Claude Code + Codex names when explicitly allowlisted', () => {
+    const prev = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read,run_command,Grep';
+    try {
+      assert.equal(canMapAllTools([fnTool('Read'), fnTool('run_command'), fnTool('Grep')]), true);
+    } finally {
+      if (prev === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+      else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = prev;
+    }
   });
 });
 
@@ -119,7 +144,9 @@ describe('shouldUseNativeBridge — auto-on heuristic', () => {
 
   it('explicit env override forces on for any mapped tool set (deployer opting into remote execution)', () => {
     const orig = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
+    const toolsOrig = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = '1';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read,Bash';
     try {
       assert.equal(
         shouldUseNativeBridge(tools, { modelKey: 'claude-sonnet-4-6', provider: 'anthropic', route: 'chat' }),
@@ -133,12 +160,16 @@ describe('shouldUseNativeBridge — auto-on heuristic', () => {
     } finally {
       if (orig === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
       else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = orig;
+      if (toolsOrig === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+      else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = toolsOrig;
     }
   });
 
   it('all_mapped mode enables only when every function tool maps', () => {
     const orig = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
+    const toolsOrig = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
     process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = 'all_mapped';
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = 'Read,Bash,Grep,Glob';
     try {
       assert.equal(
         shouldUseNativeBridge([fnTool('Read'), fnTool('Bash'), fnTool('Grep'), fnTool('Glob')], {
@@ -155,6 +186,8 @@ describe('shouldUseNativeBridge — auto-on heuristic', () => {
     } finally {
       if (orig === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
       else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = orig;
+      if (toolsOrig === undefined) delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+      else process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS = toolsOrig;
     }
   });
 
@@ -639,10 +672,11 @@ describe('partitionTools — v2.0.66 mixed-mapping splitter', () => {
     assert.equal(part.unmapped.length, 2);
   });
 
-  it('Claude Code-style (all mapped) → unmapped is empty', () => {
+  it('Claude Code-style tools keep Read/Glob out of the default native scope', () => {
     const part = partitionTools([fnTool('Read'), fnTool('Bash'), fnTool('Glob')]);
     assert.equal(part.hasAny, true);
-    assert.equal(part.unmapped.length, 0);
+    assert.deepEqual(part.mapped.map(t => t.function.name), ['Bash']);
+    assert.deepEqual(part.unmapped.map(t => t.function.name), ['Read', 'Glob']);
   });
 
   it('skips non-function entries gracefully', () => {
@@ -652,8 +686,8 @@ describe('partitionTools — v2.0.66 mixed-mapping splitter', () => {
       { type: 'function' },                 // missing function.name
       { type: 'function', function: { name: '' } },
     ]);
-    assert.equal(part.mapped.length, 1);
-    assert.equal(part.unmapped.length, 0);
+    assert.equal(part.mapped.length, 0);
+    assert.equal(part.unmapped.length, 1);
   });
 });
 
@@ -689,7 +723,7 @@ describe('TOOL_MAP — codex CLI 0.128 shell_command mapping (v2.0.66)', () => {
 describe('canMapAllTools (legacy strict gate, kept for compat)', () => {
   it('still returns false when ANY tool is unmapped', () => {
     assert.equal(canMapAllTools([fnTool('Read'), fnTool('get_weather')]), false);
-    assert.equal(canMapAllTools([fnTool('Read'), fnTool('Bash'), fnTool('Glob')]), true);
+    assert.equal(canMapAllTools([fnTool('Read'), fnTool('Bash'), fnTool('Glob')]), false);
   });
 });
 

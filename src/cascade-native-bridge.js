@@ -76,10 +76,12 @@ export const CASCADE_STEP = {
 export const CASCADE_STEP_STATUS_DONE = 3;
 
 const DEFAULT_NATIVE_BRIDGE_TOOLS = new Set([
-  'Read', 'read_file', 'view_file',
+  // Default scope is intentionally narrow: real smoke has only proven the
+  // command path stable enough for opt-in production canaries. Read/Grep/Glob
+  // translators remain in TOOL_MAP for protocol matrix work, but must be
+  // explicitly allowlisted with WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS before
+  // they are routed through the native bridge.
   'Bash', 'shell_command', 'run_command',
-  'Grep', 'grep_v2', 'grep_search', 'grep_search_v2',
-  'Glob', 'find', 'list_dir', 'list_directory',
 ]);
 
 // ─── argument translators ─────────────────────────────────────────

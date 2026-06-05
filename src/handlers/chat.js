@@ -99,6 +99,19 @@ async function internalErrorBackoff(retryIdx) {
   return ms;
 }
 
+const UPSTREAM_DEADLINE_RE = /context deadline exceeded|context cancellation while reading body|client\.timeout/i;
+
+export function isUpstreamDeadlineExceeded(errOrMessage) {
+  const msg = typeof errOrMessage === 'string'
+    ? errOrMessage
+    : String(errOrMessage?.message || '');
+  return UPSTREAM_DEADLINE_RE.test(msg);
+}
+
+function upstreamDeadlineExceededMessage(model) {
+  return `${model} hit the upstream Windsurf provider deadline (~240s): model thinking/output ran longer than the single Cascade stream window. This is not controlled by WindsurfAPI timeout env vars. Split the task, lower reasoning/max output, or use a faster model.`;
+}
+
 function upstreamTransientErrorMessage(model, triedCount, reason = 'internal_error') {
   const detail = reason === 'cascade_transport'
     ? 'Cascade/语言服务器 HTTP/2 流被取消'
@@ -2100,7 +2113,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // rationale (cascade trajectory left half-broken, next reuse hits
     // it and the model "loses" the prior conversation).
     const _resultMsg = String(result.body?.error?.message || '');
-    if (/context deadline exceeded|context cancellation while reading body|client\.timeout/i.test(_resultMsg)) {
+    if (isUpstreamDeadlineExceeded(_resultMsg)) {
       reuseEntryDead = true;
     }
     lastErr = result;
@@ -2150,6 +2163,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
       continue;
     }
     // Cascade transient 错误通常是上游或本地 LS 短暂抖动，先退避再切账号，避免连续打爆同一热窗口。
+    if (errType === 'upstream_deadline_exceeded') {
+      break;
+    }
     if (errType === 'upstream_internal_error' || errType === 'upstream_transient_error') {
       if (acct?._sticky && isExperimentalEnabled('stickyNoFallback')) {
         log.warn(`Chat[${reqId}]: ${acct.email} (sticky-bound) upstream transient error, stickyNoFallback enabled — not trying other accounts`);
@@ -2663,8 +2679,9 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     const isAuthFail = /unauthenticated|invalid api key|invalid_grant|permission_denied.*account/i.test(err.message);
     const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
     const isInternal = /internal error occurred.*error id/i.test(err.message);
+    const isDeadline = isUpstreamDeadlineExceeded(err);
     const isTransport = isCascadeTransportError(err);
-    const isTransient = isUpstreamTransientError(err, isInternal);
+    const isTransient = !isDeadline && isUpstreamTransientError(err, isInternal);
     // v2.0.61 (#113): Anthropic / OpenAI content-policy / verification
     // challenges are NOT transient — rotating accounts won't help and
     // wastes quota. Detect and short-circuit with a clean 451 + clear
@@ -2731,6 +2748,20 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
           } },
         };
       }
+    }
+    if (isDeadline) {
+      return {
+        status: 504,
+        reuseEntryInvalid: !!err.reuseEntryInvalid,
+        body: {
+          error: {
+            message: upstreamDeadlineExceededMessage(model),
+            type: 'upstream_deadline_exceeded',
+            code: 'windsurf_provider_deadline',
+            upstream_message: sanitizeText(err.message).slice(0, 240),
+          },
+        },
+      };
     }
     return {
       status: isTransient ? 502 : (err.isModelError ? 403 : 502),
@@ -3452,14 +3483,15 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             // result with no earlier user prompts ("I can see the
             // content from a previous tool call ... but I don't have
             // the earlier conversation context").
-            if (/context deadline exceeded|context cancellation while reading body|client\.timeout/i.test(err.message || '')) {
+            const isDeadline = isUpstreamDeadlineExceeded(err);
+            if (isDeadline) {
               reuseEntryDead = true;
             }
             const isAuthFail = /unauthenticated|invalid api key|invalid_grant|permission_denied.*account/i.test(err.message);
             const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
             const isInternal = /internal error occurred.*error id/i.test(err.message);
             const isTransport = isCascadeTransportError(err);
-            const isTransient = isUpstreamTransientError(err, isInternal);
+            const isTransient = !isDeadline && isUpstreamTransientError(err, isInternal);
             // v2.0.61 (#113) — same policy detection as nonStreamResponse.
             const isPolicyBlocked = /cyber\s*verification|content[\s_-]+policy|policy[\s_-]+(?:violation|blocked|denied)|safety[\s_-]+(?:policy|blocked)|prompt[\s_-]+(?:rejected|blocked)\s+by[\s_-]+policy|usage[\s_-]+policy[\s_-]+violation/i.test(err.message);
             if (isAuthFail) reportError(currentApiKey);
@@ -3511,6 +3543,11 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               log.warn(`Chat[${reqId}] stream: policy_blocked on ${currentApiKey?.slice(0, 12)}..., not retrying`);
               break;
             }
+            if (isDeadline) {
+              err.type = 'upstream_deadline_exceeded';
+              err.code = 'windsurf_provider_deadline';
+              break;
+            }
             // Retry only if nothing has been streamed yet AND it's a retryable error
             if (!hadSuccess && (err.isModelError || isRateLimit)) {
               if (acct?._sticky && isExperimentalEnabled('stickyNoFallback')) {
@@ -3546,10 +3583,13 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
           const rl = isAllRateLimited(modelKey);
           const allInternal = streamInternalCount > 0 && tried.length > 0 && streamInternalCount >= tried.length;
           const poolExhausted = isLsPoolExhausted(lastErr);
+          const deadlineExceeded = isUpstreamDeadlineExceeded(lastErr) || lastErr?.type === 'upstream_deadline_exceeded';
           // 优先暴露 upstream_transient，避免把 Cascade transport 抖动误报成账号限流。
           const lastIsTransport = isCascadeTransportError(lastErr);
           const errMsg = allInternal
             ? upstreamTransientErrorMessage(model, tried.length, lastIsTransport ? 'cascade_transport' : 'internal_error')
+            : deadlineExceeded
+            ? upstreamDeadlineExceededMessage(model)
             : poolExhausted
             ? sanitizeText(lastErr?.message || 'language server pool exhausted')
             : temporaryUnavailable.allUnavailable
@@ -3576,22 +3616,26 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             // go to the server log.
             const errType = allInternal
               ? 'upstream_transient_error'
+              : deadlineExceeded
+                ? 'upstream_deadline_exceeded'
               : poolExhausted
                 ? 'ls_pool_exhausted'
               : (temporaryUnavailable.allUnavailable || lastErr?.type === 'rate_limit_exceeded')
                 ? 'rate_limit_exceeded'
                 : 'upstream_error';
-            send(chatStreamError(errMsg, errType));
+            send(chatStreamError(errMsg, errType, deadlineExceeded ? 'windsurf_provider_deadline' : null));
             log.warn(`Stream: partial response delivered then failed (${errMsg})`);
           } else {
             const errType = allInternal
               ? 'upstream_transient_error'
+              : deadlineExceeded
+                ? 'upstream_deadline_exceeded'
               : poolExhausted
                 ? 'ls_pool_exhausted'
               : (temporaryUnavailable.allUnavailable || lastErr?.type === 'rate_limit_exceeded')
                 ? 'rate_limit_exceeded'
                 : 'upstream_error';
-            send(chatStreamError(errMsg, errType));
+            send(chatStreamError(errMsg, errType, deadlineExceeded ? 'windsurf_provider_deadline' : null));
           }
           res.write('data: [DONE]\n\n');
         } catch {}

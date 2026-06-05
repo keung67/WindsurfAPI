@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http2 from 'http2';
 import { isCascadeTransportError } from '../src/client.js';
-import { chatStreamError, isUpstreamTransientError, redactRequestLogText } from '../src/handlers/chat.js';
+import { chatStreamError, isUpstreamDeadlineExceeded, isUpstreamTransientError, redactRequestLogText } from '../src/handlers/chat.js';
 import { handleMessages } from '../src/handlers/messages.js';
 
 function parseEvents(raw) {
@@ -46,6 +46,13 @@ describe('stream error protocol', () => {
     assert.equal(isCascadeTransportError(err), true);
     assert.equal(isUpstreamTransientError(err), true);
     assert.equal(isUpstreamTransientError(new Error('permission_denied: model unavailable')), false);
+  });
+
+  it('classifies provider context deadline as upstream deadline, not generic transient', () => {
+    const err = new Error('Encountered retryable error from model provider: context deadline exceeded (Client.Timeout or context cancellation while reading body)');
+    assert.equal(isUpstreamDeadlineExceeded(err), true);
+    assert.equal(isUpstreamTransientError(err), false);
+    assert.equal(isUpstreamDeadlineExceeded('rate limit exceeded'), false);
   });
 
   it('redacts common secret patterns before debug request-body logging', () => {
