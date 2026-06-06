@@ -52,6 +52,7 @@ import {
 const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
+const IP_RATE_LIMIT_BURST_FLOOR_MS = 30_000;
 
 // Build the option bag the v2.0.25 semantic key needs. tools / tool_choice /
 // preamble are baked into the digest so a tool schema change misses instead
@@ -826,7 +827,7 @@ export function repairToolCallArguments(tc, messages) {
   return tc;
 }
 
-export function rateLimitCooldownMs(message = '') {
+export function parseRateLimitCooldownMs(message = '') {
   const reset = String(message || '').match(/resets?\s+in\s*:?\s*((?:(?:\d+)\s*[hms]\s*)+)/i);
   if (reset) {
     let total = 0;
@@ -848,7 +849,41 @@ export function rateLimitCooldownMs(message = '') {
     return n * 1000;
   }
   if (/about an hour|in an hour|try again in.*hour/i.test(message)) return 60 * 60 * 1000;
-  return 60 * 1000;
+  return null;
+}
+
+export function rateLimitCooldownMs(message = '') {
+  return parseRateLimitCooldownMs(message) || 60 * 1000;
+}
+
+function formatRetryAfter(ms) {
+  const seconds = Math.max(1, Math.ceil(Number(ms) / 1000));
+  if (seconds >= 3600) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.ceil((seconds - h * 3600) / 60);
+    return m > 0 ? `${h}h${m}m` : `${h}h`;
+  }
+  if (seconds >= 60) {
+    const m = Math.floor(seconds / 60);
+    const s = seconds - m * 60;
+    return s > 0 ? `${m}m${s}s` : `${m}m`;
+  }
+  return `${seconds}s`;
+}
+
+export function rateLimitBurstCooldownMs({ message = '', retryAfterMs = 0, apiKey = '', modelKey = '' } = {}) {
+  const candidates = [IP_RATE_LIMIT_BURST_FLOOR_MS];
+  const retry = Number(retryAfterMs);
+  if (Number.isFinite(retry) && retry > 0) candidates.push(retry);
+  const parsed = parseRateLimitCooldownMs(message);
+  if (Number.isFinite(parsed) && parsed > 0) candidates.push(parsed);
+  if (apiKey) {
+    const availability = getAccountAvailability(apiKey, modelKey);
+    if (!availability.available && Number.isFinite(availability.retryAfterMs) && availability.retryAfterMs > 0) {
+      candidates.push(availability.retryAfterMs);
+    }
+  }
+  return Math.max(...candidates);
 }
 
 function genId() {
@@ -1492,6 +1527,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
   const cachePolicy = body.__cachePolicy || null;
   const checkMessageRateLimitFn = context.checkMessageRateLimit || checkMessageRateLimit;
   const waitForAccountFn = context.waitForAccount || waitForAccount;
+  const ensureLsFn = context.ensureLs || ensureLs;
+  const getLsForFn = context.getLsFor || getLsFor;
+  const WindsurfClientClass = context.WindsurfClient || WindsurfClient;
 
   // Probe diagnostics: dump compact request shape for every call, plus a
   // tail of the last user turn. Keeps us able to see how third-party
@@ -2179,11 +2217,11 @@ async function _handleChatCompletionsInner(body, context = {}) {
       }
     }
 
-    try { await ensureLs(acct.proxy); } catch (e) {
+    try { await ensureLsFn(acct.proxy); } catch (e) {
       lastErr = isLsPoolExhausted(e) ? lsPoolExhaustedResponse(e) : { status: e.status || 503, body: { error: { message: e.message || String(e), type: e.type || 'ls_unavailable' } } };
       break;
     }
-    const ls = getLsFor(acct.proxy);
+    const ls = getLsForFn(acct.proxy);
     if (!ls) { lastErr = { status: 503, body: { error: { message: 'No LS instance available', type: 'ls_unavailable' } } }; break; }
     // Cascade pins cascade_id to a specific LS port too; if the LS it was
     // born on has been replaced, the cascade_id is dead.
@@ -2197,7 +2235,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       return n + (typeof c === 'string' ? c.length : Array.isArray(c) ? c.reduce((k, p) => k + (typeof p?.text === 'string' ? p.text.length : 0), 0) : 0);
     }, 0);
     log.info(`Chat[${reqId}]: model=${displayModel} flow=${useCascade ? 'cascade' : 'legacy'} attempt=${attempt + 1} account=${acct.email} ls=${ls.port} turns=${(messages||[]).length} chars=${_msgChars}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
-    const client = new WindsurfClient(acct.apiKey, ls.port, ls.csrfToken);
+    const client = new WindsurfClientClass(acct.apiKey, ls.port, ls.csrfToken);
     const result = await nonStreamResponse(
       client, chatId, created, displayModel, routingModelKey, messages, cascadeMessages, modelEnum, modelUid,
       useCascade, acct.apiKey, ckey,
@@ -2224,8 +2262,14 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // see the matching catch block in streamResponse for the full
     // rationale (cascade trajectory left half-broken, next reuse hits
     // it and the model "loses" the prior conversation).
-    const _resultMsg = String(result.body?.error?.message || '');
-    if (isUpstreamDeadlineExceeded(_resultMsg)) {
+    const _resultError = result.body?.error || {};
+    const _resultMsg = String(_resultError.upstream_message || _resultError.message || '');
+    if (
+      result.status === 504
+      || _resultError.type === 'upstream_deadline_exceeded'
+      || _resultError.code === 'windsurf_provider_deadline'
+      || isUpstreamDeadlineExceeded(_resultMsg)
+    ) {
       reuseEntryDead = true;
     }
     lastErr = result;
@@ -2245,7 +2289,17 @@ async function _handleChatCompletionsInner(body, context = {}) {
       if (!context.__rateLimitEvents) context.__rateLimitEvents = [];
       const RL_WINDOW_MS = 8_000;
       const RL_BURST_THRESHOLD = 3;
-      context.__rateLimitEvents.push({ time: Date.now(), model: routingModelKey, account: acct.id });
+      context.__rateLimitEvents.push({
+        time: Date.now(),
+        model: routingModelKey,
+        account: acct.id,
+        cooldownMs: rateLimitBurstCooldownMs({
+          message: result.body?.error?.message || '',
+          retryAfterMs: result.body?.error?.retry_after_ms,
+          apiKey: acct.apiKey,
+          modelKey: routingModelKey,
+        }),
+      });
       // Prune old events
       const cutoff = Date.now() - RL_WINDOW_MS;
       while (context.__rateLimitEvents.length && context.__rateLimitEvents[0].time < cutoff) {
@@ -2253,14 +2307,14 @@ async function _handleChatCompletionsInner(body, context = {}) {
       }
       const sameModelBurst = context.__rateLimitEvents.filter(e => e.model === routingModelKey);
       if (sameModelBurst.length >= RL_BURST_THRESHOLD) {
-        const maxCooldown = Math.max(...sameModelBurst.map(() => 30_000));
+        const maxCooldown = Math.max(...sameModelBurst.map(e => e.cooldownMs || IP_RATE_LIMIT_BURST_FLOOR_MS));
         log.warn(`Chat[${reqId}]: IP-rate-limit burst detected — ${sameModelBurst.length} accounts rate-limited on ${displayModel} within ${RL_WINDOW_MS}ms. Short-circuiting.`);
         return {
           status: 429,
           headers: { 'Retry-After': String(Math.ceil(maxCooldown / 1000)) },
           body: {
             error: {
-              message: `All accounts temporarily rate-limited on ${displayModel}. Windsurf upstream is applying IP-level cooldown. Wait ${Math.ceil(maxCooldown / 1000)}s before retrying, or switch to a different model.`,
+              message: `All accounts temporarily rate-limited on ${displayModel}. Windsurf upstream is applying IP-level cooldown. Wait ${formatRetryAfter(maxCooldown)} before retrying, or switch to a different model.`,
               type: 'rate_limit_exceeded',
               retry_after_ms: maxCooldown,
             },
@@ -3618,7 +3672,17 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               const RL_WINDOW_MS = 8_000;
               const RL_BURST_THRESHOLD = 3;
               const now = Date.now();
-              ctx.__rateLimitEvents.push({ time: now, model: modelKey, account: acct?.id });
+              ctx.__rateLimitEvents.push({
+                time: now,
+                model: modelKey,
+                account: acct?.id,
+                cooldownMs: rateLimitBurstCooldownMs({
+                  message: err.message || '',
+                  retryAfterMs: err.retry_after_ms,
+                  apiKey: currentApiKey,
+                  modelKey,
+                }),
+              });
               const cutoff = now - RL_WINDOW_MS;
               while (ctx.__rateLimitEvents.length && ctx.__rateLimitEvents[0].time < cutoff) {
                 ctx.__rateLimitEvents.shift();
@@ -3627,8 +3691,8 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               if (sameModelBurst.length >= RL_BURST_THRESHOLD) {
                 ctx.__rlAborted = true;
                 log.warn(`Chat[${reqId}] stream: IP-rate-limit burst — ${sameModelBurst.length} accounts rate-limited on ${model} within ${RL_WINDOW_MS}ms. Short-circuiting.`);
-                const cooldown = Math.max(...sameModelBurst.map(() => 30_000));
-                lastErr = Object.assign(new Error(`All accounts temporarily rate-limited on ${model}. Windsurf upstream is applying IP-level cooldown. Wait ~${Math.ceil(cooldown / 1000)}s before retrying.`), { type: 'rate_limit_exceeded', retry_after_ms: cooldown });
+                const cooldown = Math.max(...sameModelBurst.map(e => e.cooldownMs || IP_RATE_LIMIT_BURST_FLOOR_MS));
+                lastErr = Object.assign(new Error(`All accounts temporarily rate-limited on ${model}. Windsurf upstream is applying IP-level cooldown. Wait ~${formatRetryAfter(cooldown)} before retrying.`), { type: 'rate_limit_exceeded', retry_after_ms: cooldown });
                 break;
               }
             }

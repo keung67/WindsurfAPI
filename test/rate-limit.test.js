@@ -10,7 +10,7 @@ import {
   removeAccount,
   setAccountTier,
 } from '../src/auth.js';
-import { handleChatCompletions, rateLimitCooldownMs } from '../src/handlers/chat.js';
+import { handleChatCompletions, rateLimitBurstCooldownMs, rateLimitCooldownMs } from '../src/handlers/chat.js';
 import { getExperimental, setExperimental } from '../src/runtime-config.js';
 
 const createdAccountIds = [];
@@ -71,6 +71,55 @@ describe('rate-limit handling', () => {
     );
     assert.equal(rateLimitCooldownMs('Resets in: 59s'), 59000);
     assert.equal(rateLimitCooldownMs('resets in 3h'), 3 * 60 * 60 * 1000);
+  });
+
+  it('keeps real upstream cooldowns for IP-level burst short-circuiting', () => {
+    assert.equal(
+      rateLimitBurstCooldownMs({
+        message: 'Reached message rate limit for this model. Please try again later. Resets in: 27m12s (trace ID: abc)',
+        retryAfterMs: 30000,
+      }),
+      (27 * 60 * 1000) + (12 * 1000)
+    );
+    assert.equal(rateLimitBurstCooldownMs({ message: 'rate limit exceeded' }), 30000);
+  });
+
+  it('uses real upstream cooldowns in the non-stream IP burst response', async () => {
+    const accounts = [
+      addTestAccount('ip-burst-a'),
+      addTestAccount('ip-burst-b'),
+      addTestAccount('ip-burst-c'),
+    ];
+    for (const account of accounts) setAccountTier(account.id, 'free');
+
+    class RateLimitedClient {
+      async cascadeChat() {
+        throw new Error('Reached message rate limit for this model. Please try again later. Resets in: 27m12s (trace ID: abc)');
+      }
+      async rawGetChatMessage() {
+        throw new Error('Reached message rate limit for this model. Please try again later. Resets in: 27m12s (trace ID: abc)');
+      }
+    }
+
+    const result = await handleChatCompletions({
+      model: 'gemini-2.5-flash',
+      messages: [{ role: 'user', content: `hi ${Date.now()}` }],
+    }, {
+      async waitForAccount(tried, signal, maxWaitMs, modelKey) {
+        return getApiKey(tried, modelKey);
+      },
+      async ensureLs() {},
+      getLsFor() {
+        return { port: 12345, csrfToken: 'csrf-test' };
+      },
+      WindsurfClient: RateLimitedClient,
+    });
+
+    assert.equal(result.status, 429);
+    assert.equal(result.body.error.type, 'rate_limit_exceeded');
+    assert.equal(result.body.error.retry_after_ms, (27 * 60 * 1000) + (12 * 1000));
+    assert.equal(result.headers['Retry-After'], '1632');
+    assert.match(result.body.error.message, /27m12s/);
   });
 
   it('does not extend an existing cooldown when a later 429 arrives for the same model', async () => {

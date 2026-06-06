@@ -406,6 +406,15 @@ A: 看模型。Claude family `<tool_use>` 协议训练扎实最稳（free 账号
 **Q: 31 个 trial 账号一会儿就全 unavailable**
 A: 八成是用了周限模型 — `claude-opus-4-7-max` / `gpt-5.5-xhigh` / `claude-sonnet-4-7-thinking` 这类高 reasoning effort 变体每个账号每周只有 5 次配额，31 号 × 5 次 ≈ 150 次就到顶。换 `claude-sonnet-4.6` / `claude-haiku-4.5` daily 配额比较宽松。`docker logs windsurfapi-windsurf-api-1 | grep rate_limit` 看每个账号的 cooldown 字段验证。
 
+**Q: All accounts temporarily rate-limited / IP-level cooldown 是不是代理坏了**
+A: 通常不是。Windsurf 上游会对同一出口 IP + 同一模型的密集请求施加 cooldown，多个账号绑在同一出口时会一起被限流。WindsurfAPI 会停止继续烧账号并返回 `429 + Retry-After`；v2.0.140 起这个等待时间会按上游 `Resets in: 27m12s` 这类真实值返回，而不是固定提示 30 秒。解决方向是降并发、换更宽松模型、给账号绑定不同出口 IP，或者等上游 cooldown 到期。
+
+**Q: free 账号是不是本地限制成 1 分钟 1 次**
+A: 不是。本地 free tier RPM 默认是 10/min。你看到的 1/min 或一段时间后恢复，通常是 Windsurf 上游 free-tier 动态限频或模型 entitlement 限制。Dashboard 里看账号状态和模型可用清单；请求无权限模型时错误里的 `available_in_pool` 会列出当前账号池能用的模型。
+
+**Q: context deadline exceeded / Client.Timeout 能靠调大 .env timeout 解决吗**
+A: 不能。长 thinking / 长输出在约 236-243 秒断流，是 Windsurf provider/Cascade 单次 stream 窗口。WindsurfAPI 会把它标成 `upstream_deadline_exceeded` / `windsurf_provider_deadline`，并丢弃半截 Cascade 复用轨迹，避免下一轮上下文错乱。实际规避只能拆任务、降低 reasoning/max output，或换更快模型。
+
 ## 贡献者
 
 特别感谢下面的朋友，他们提交过 PR 或系统性地审了代码，让这个项目变得更稳：
