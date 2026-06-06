@@ -77,6 +77,22 @@ function basenameOfPath(s) {
   return parts.length ? parts[parts.length - 1].slice(0, 120) : '';
 }
 
+function summarizeReadWrapperStringField(field, value, bytes, sha256) {
+  const text = String(value || '');
+  const looksPath = looksPathLike(text);
+  const looksPrompt = looksPromptLike(text);
+  const acceptedByParser = (field === 1 || field === 2) && looksPath;
+  return {
+    field,
+    bytes,
+    sha256,
+    looksPathLike: looksPath,
+    looksPromptLike: looksPrompt,
+    acceptedByParser,
+    basename: looksPath ? basenameOfPath(text) : '',
+  };
+}
+
 function looksLikeMessage(buf) {
   if (!buf?.length) return false;
   const key = buf[0];
@@ -511,6 +527,8 @@ function summarizeHandleCascadeUserInteraction(payload) {
 
 function summarizeReadWrapperField19(wrapperBuf) {
   const fields = parseFields(wrapperBuf);
+  const candidates = [];
+  let acceptedField = null;
   return {
     bytes: wrapperBuf.length,
     fieldNumbers: fields.map(f => f.field),
@@ -535,12 +553,16 @@ function summarizeReadWrapperField19(wrapperBuf) {
         }
         if (mostlyText(f.value)) {
           const text = f.value.toString('utf8');
+          const candidate = summarizeReadWrapperStringField(f.field, text, f.value.length, out.sha256);
+          candidates.push(candidate);
+          if (acceptedField == null && candidate.acceptedByParser) acceptedField = f.field;
           out.type = 'string';
           out.hasNewline = /[\r\n]/.test(text);
           out.hasAngleBracket = /[<>]/.test(text);
-          out.looksPathLike = looksPathLike(text);
-          out.looksPromptLike = looksPromptLike(text);
-          out.basename = out.looksPathLike ? basenameOfPath(text) : '';
+          out.looksPathLike = candidate.looksPathLike;
+          out.looksPromptLike = candidate.looksPromptLike;
+          out.basename = candidate.basename;
+          out.acceptedByParser = candidate.acceptedByParser;
           if (process.env.WINDSURFAPI_PROTO_TRACE_READ_WRAPPER_STRINGS === '1') {
             out.preview = redactPreview(text);
           }
@@ -550,6 +572,13 @@ function summarizeReadWrapperField19(wrapperBuf) {
         out.summary = summarizeMessageChildren(f.value, 8);
         return out;
       }),
+    candidateSummary: {
+      acceptedField,
+      pathLikeFields: candidates.filter(c => c.looksPathLike).map(c => c.field),
+      rejectedPromptFields: candidates.filter(c => c.looksPromptLike && !c.acceptedByParser).map(c => c.field),
+      ambiguous: candidates.filter(c => c.acceptedByParser).length > 1,
+      candidates,
+    },
   };
 }
 
@@ -662,6 +691,37 @@ function summarizeErrorStep(fields) {
   };
 }
 
+function summarizeWebFetchTrajectoryBranch({ type, status, nativeOneofs, requestedInteraction, errorStep }) {
+  const readUrlOneof = nativeOneofs.find(x => x.kind === 'read_url_content') || null;
+  const pendingReadUrl = requestedInteraction?.interactions?.find(x => x.kind === 'read_url_content') || null;
+  const classifications = errorStep?.classifications || {};
+  const hasWebDocument = !!readUrlOneof?.body?.webDocument;
+  const legacySummaryBytes = readUrlOneof?.body?.legacySummaryBytes || 0;
+  const hasLegacySummary = legacySummaryBytes > 0;
+  const autoRunDecision = readUrlOneof?.body?.autoRunDecision ?? null;
+  let state = null;
+  if (pendingReadUrl) state = 'pending_permission';
+  else if (readUrlOneof && hasWebDocument) state = 'completed_web_document';
+  else if (readUrlOneof && autoRunDecision != null && !hasWebDocument && !hasLegacySummary) state = 'auto_run_decision_only';
+  else if (readUrlOneof && hasLegacySummary && !hasWebDocument) state = 'legacy_summary_only';
+  else if (readUrlOneof) state = 'native_oneof_no_document';
+  else if (type === 17 && (classifications.permissionDenied || classifications.failedPrecondition)) state = 'error';
+  if (!state) return null;
+  return {
+    state,
+    stepType: type,
+    status,
+    hasRequestedInteraction: !!pendingReadUrl,
+    hasReadUrlOneof: !!readUrlOneof,
+    hasWebDocument,
+    legacySummaryBytes,
+    autoRunDecision,
+    readUrlFieldNumbers: readUrlOneof?.body?.fieldNumbers || [],
+    requestedFieldNumbers: pendingReadUrl?.body?.fieldNumbers || [],
+    errorClassifications: compactTrueFlags(classifications),
+  };
+}
+
 function summarizeTrajectoryStep(stepBuf, index) {
   const fields = parseFields(stepBuf);
   const oneofFields = [];
@@ -683,18 +743,28 @@ function summarizeTrajectoryStep(stepBuf, index) {
       ...summarizeMessageChildren(f.value, 8),
     }));
   const type = numberField(fields, 1);
+  const status = numberField(fields, 4);
   const wrapper19 = type === 14 ? getField(fields, 19, 2) : null;
   const requestedInteraction = getField(fields, 56, 2);
+  const requestedInteractionSummary = requestedInteraction ? summarizeRequestedInteraction(requestedInteraction.value) : null;
   const errorStep = summarizeErrorStep(fields);
+  const webFetchTrace = summarizeWebFetchTrajectoryBranch({
+    type,
+    status,
+    nativeOneofs: oneofFields,
+    requestedInteraction: requestedInteractionSummary,
+    errorStep,
+  });
   return {
     index,
     type,
-    status: numberField(fields, 4),
+    status,
     fieldNumbers: fields.map(f => f.field),
     nativeOneofs: oneofFields,
     messageFields: interestingFields,
     ...(wrapper19 ? { readWrapperField19: summarizeReadWrapperField19(wrapper19.value) } : {}),
-    ...(requestedInteraction ? { requestedInteraction: summarizeRequestedInteraction(requestedInteraction.value) } : {}),
+    ...(requestedInteractionSummary ? { requestedInteraction: requestedInteractionSummary } : {}),
+    ...(webFetchTrace ? { webFetchTrace } : {}),
     ...(errorStep ? { errorStep } : {}),
   };
 }

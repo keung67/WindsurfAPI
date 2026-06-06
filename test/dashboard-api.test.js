@@ -1,7 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { config } from '../src/config.js';
-import { configureBindHost, _resetLockoutForTests } from '../src/auth.js';
+import { addAccountByKey, configureBindHost, removeAccount, _resetLockoutForTests } from '../src/auth.js';
 import { buildBatchProxyBinding, handleDashboardApi } from '../src/dashboard/api.js';
 import {
   recordNativeBridgeDecision,
@@ -13,8 +13,11 @@ const originalDashboardPassword = config.dashboardPassword;
 const originalApiKey = config.apiKey;
 const originalNativeBridgeApiKeys = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_API_KEYS;
 const originalNativeBridgeAccounts = process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_ACCOUNTS;
+const createdAccounts = new Set();
 
 afterEach(() => {
+  for (const id of createdAccounts) removeAccount(id);
+  createdAccounts.clear();
   _resetRuntimeConfigForTests();
   _resetLockoutForTests();
   config.dashboardPassword = originalDashboardPassword;
@@ -35,6 +38,16 @@ function fakeRes() {
     end(chunk) { this.body += chunk ? String(chunk) : ''; },
     json() { return this.body ? JSON.parse(this.body) : null; },
   };
+}
+
+function localReq(path) {
+  return { url: `/dashboard/api${path}`, headers: {}, socket: { remoteAddress: '127.0.0.1' } };
+}
+
+function addTestAccount(label) {
+  const account = addAccountByKey(`test-key-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}`, label);
+  createdAccounts.add(account.id);
+  return account;
 }
 
 describe('dashboard batch import proxy binding', () => {
@@ -120,5 +133,46 @@ describe('dashboard batch import proxy binding', () => {
     assert.equal(raw.includes('secret-api-key'), false);
     assert.equal(raw.includes('secret-account'), false);
     assert.equal(raw.includes('secret-caller'), false);
+  });
+
+  it('supports paged lightweight account summaries without breaking the legacy full list', async () => {
+    _resetRuntimeConfigForTests();
+    config.dashboardPassword = '';
+    config.apiKey = '';
+    configureBindHost('127.0.0.1');
+    const a1 = addTestAccount('dashboard-summary-a');
+    const a2 = addTestAccount('dashboard-summary-b');
+
+    const summaryRes = fakeRes();
+    await handleDashboardApi('GET', '/accounts', {}, localReq('/accounts?view=summary&page=1&pageSize=1'), summaryRes);
+    const summary = summaryRes.json();
+    assert.equal(summaryRes.statusCode, 200);
+    assert.equal(summary.page, 1);
+    assert.equal(summary.pageSize, 1);
+    assert.ok(summary.total >= 2);
+    assert.equal(summary.accounts.length, 1);
+    assert.ok('tierModelCount' in summary.accounts[0]);
+    assert.equal('tierModels' in summary.accounts[0], false);
+    assert.equal('availableModels' in summary.accounts[0], false);
+    assert.equal('capabilities' in summary.accounts[0], false);
+    assert.equal('lsAdmission' in summary.accounts[0], false);
+
+    const detailRes = fakeRes();
+    await handleDashboardApi('GET', `/accounts/${a2.id}`, {}, localReq(`/accounts/${a2.id}`), detailRes);
+    const detail = detailRes.json();
+    assert.equal(detailRes.statusCode, 200);
+    assert.equal(detail.account.id, a2.id);
+    assert.ok(Array.isArray(detail.account.tierModels));
+    assert.ok(Array.isArray(detail.account.availableModels));
+    assert.ok('capabilities' in detail.account);
+
+    const legacyRes = fakeRes();
+    await handleDashboardApi('GET', '/accounts', {}, localReq('/accounts'), legacyRes);
+    const legacy = legacyRes.json();
+    const legacyA1 = legacy.accounts.find(a => a.id === a1.id);
+    assert.equal(legacyRes.statusCode, 200);
+    assert.ok(legacyA1);
+    assert.ok(Array.isArray(legacyA1.tierModels));
+    assert.ok(Array.isArray(legacyA1.availableModels));
   });
 });

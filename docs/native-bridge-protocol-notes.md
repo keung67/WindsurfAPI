@@ -149,6 +149,19 @@ hashes, and safe classifications such as `looksPathLike` and
 `looksPromptLike`. Do not use the global raw-string trace switch for production
 traffic; it can capture prompts.
 
+v2.0.137 adds a parser-aligned evidence block at
+`semantic.steps[].readWrapperField19.candidateSummary`:
+
+- `acceptedField` = the field current production parsing would accept
+  (`1`/`2` only, and only when path-like), otherwise `null`
+- `pathLikeFields` = fields whose string payload looks like a path/file URI
+- `rejectedPromptFields` = prompt-like string fields not accepted by the parser
+- `ambiguous` = more than one accepted field, which is a trace investigation
+  signal rather than a license to widen production parsing
+
+This lets a gated canary answer "which field would the current Read parser
+use?" without printing the actual file path or prompt text.
+
 Error trajectory steps also have a dedicated redacted summary. For `type=17`
 or any step carrying `error_message` field `24` / `error` field `31`, traces
 now expose `semantic.steps[].errorStep` with source field numbers, byte
@@ -338,10 +351,27 @@ User settings that influence auto-approval:
 
 `WINDSURFAPI_PROTO_TRACE` now summarizes `requested_interaction=56` and its
 read-url body with byte lengths and hashes only. It also summarizes
-`HandleCascadeUserInteraction` requests, including cascade/trajectory ID hashes,
-step index, action enum, and URL/origin hashes. The next valid WebFetch canary
-decision point is: after approval, did the LS emit a completed `field=40` step
-with `web_document`, an error step, or another requested interaction?
+`HandleCascadeUserInteraction` requests, including cascade/trajectory ID
+hashes, step index, action enum, and URL/origin hashes.
+
+v2.0.137 adds
+`semantic.steps[].webFetchTrace` so a canary can classify the post-approval
+trajectory without raw URL text:
+
+- `pending_permission`
+- `completed_web_document`
+- `auto_run_decision_only`
+- `legacy_summary_only`
+- `native_oneof_no_document`
+- `error` with redacted `permissionDenied` / `failedPrecondition` style flags
+
+Use this field after `HandleCascadeUserInteraction` to decide whether the LS
+advanced to a real `read_url_content.web_document`, repeated the permission
+prompt, or failed a precondition.
+
+The next valid WebFetch canary decision point is: after approval, did the LS
+emit a completed `field=40` step with `web_document`, an error step, or another
+requested interaction?
 
 v2.0.135 adds a lab-only auto-approval hook for this canary:
 

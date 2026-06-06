@@ -502,6 +502,29 @@ tbody tr:hover td { background: var(--surface-2); }
   padding: 32px 16px;
   font-style: italic;
 }
+.table-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.table-pagination .select {
+  width: auto;
+  min-width: 84px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+.table-pagination .page-label {
+  min-width: 160px;
+  text-align: center;
+  color: var(--text-muted);
+}
 
 /* ─── Account detail panel (expand-in-row) ──────────── */
 .expand-chevron {
@@ -1953,6 +1976,17 @@ window._firebaseOAuth = async function(provider) {
             <tbody></tbody>
           </table>
         </div>
+        <div class="table-pagination" id="accounts-pagination">
+          <button class="btn btn-ghost btn-xs" id="accounts-prev" onclick="App.setAccountsPage(App.accountsPage - 1)">Prev</button>
+          <span class="page-label" id="accounts-page-label">-</span>
+          <select class="select" id="accounts-page-size" onchange="App.setAccountsPageSize(this.value)">
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+          <button class="btn btn-ghost btn-xs" id="accounts-next" onclick="App.setAccountsPage(App.accountsPage + 1)">Next</button>
+        </div>
       </div>
     </div>
   </section>
@@ -2638,6 +2672,11 @@ const App = {
   modelAccessConfig: { mode: 'all', list: [] },
   loginHistory: JSON.parse(localStorage.getItem('wl_history') || '[]'),
   _filterTimer: null,
+  accountsPage: 1,
+  accountsPageSize: Number(localStorage.getItem('accountsPageSize') || 50),
+  accountsTotal: 0,
+  accountsHasMore: false,
+  _accountDetails: new Map(),
 
   applyLang() {
     // Delegate to new I18n system
@@ -3693,12 +3732,67 @@ docker compose up -d --force-recreate</pre>
   },
 
   // ─── Accounts ────────────────────────────────
+  accountsListUrl({ page = this.accountsPage, pageSize = this.accountsPageSize, filter = '' } = {}) {
+    const qs = new URLSearchParams();
+    qs.set('view', 'summary');
+    qs.set('page', String(Math.max(1, Number(page) || 1)));
+    qs.set('pageSize', String(Math.max(1, Math.min(200, Number(pageSize) || 50))));
+    if (filter) qs.set('filter', filter);
+    return `/accounts?${qs.toString()}`;
+  },
+
+  renderAccountsPagination(d = {}) {
+    const total = Number(d.total || 0);
+    const pageSize = Number(d.pageSize || this.accountsPageSize || 50);
+    const page = Number(d.page || this.accountsPage || 1);
+    this.accountsPage = page;
+    this.accountsPageSize = pageSize;
+    this.accountsTotal = total;
+    this.accountsHasMore = !!d.hasMore;
+    const label = document.getElementById('accounts-page-label');
+    const prev = document.getElementById('accounts-prev');
+    const next = document.getElementById('accounts-next');
+    const size = document.getElementById('accounts-page-size');
+    if (label) {
+      const from = total === 0 ? 0 : ((page - 1) * pageSize + 1);
+      const to = Math.min(total, from + (d.accounts?.length || 0) - 1);
+      label.textContent = `${from}-${to} / ${total}`;
+    }
+    if (prev) prev.disabled = page <= 1;
+    if (next) next.disabled = !d.hasMore;
+    if (size) size.value = String(pageSize);
+  },
+
+  setAccountsPage(page) {
+    const next = Math.max(1, Number(page) || 1);
+    if (next === this.accountsPage) return;
+    this.accountsPage = next;
+    this.loadAccounts();
+  },
+
+  setAccountsPageSize(value) {
+    const next = Math.max(1, Math.min(200, Number(value) || 50));
+    this.accountsPageSize = next;
+    this.accountsPage = 1;
+    localStorage.setItem('accountsPageSize', String(next));
+    this.loadAccounts();
+  },
+
+  async getAccountDetail(id, { force = false } = {}) {
+    if (!force && this._accountDetails?.has(id)) return this._accountDetails.get(id);
+    const d = await this.api('GET', `/accounts/${encodeURIComponent(id)}`);
+    if (!d?.account) throw new Error(I18n.t('error.accountNotFound'));
+    if (!this._accountDetails) this._accountDetails = new Map();
+    this._accountDetails.set(id, d.account);
+    return d.account;
+  },
+
   async loadAccounts() {
     // v2.0.57 Fix 5 — refresh drought banner alongside accounts so a low
     // pool state shows up the moment the user opens the panel.
     this.loadDrought();
     const [d, ov] = await Promise.all([
-      this.api('GET', '/accounts'),
+      this.api('GET', this.accountsListUrl()),
       this.api('GET', '/overview').catch(() => null),
     ]);
     const instances = ov?.langServer?.instances || [];
@@ -3737,8 +3831,14 @@ docker compose up -d --force-recreate</pre>
       }
     }
     const tbody = document.querySelector('#accounts-table tbody');
+    this.renderAccountsPagination(d);
     const tierLabel = { pro: 'PRO', free: 'FREE', expired: I18n.t('tier.expiredLabel'), unknown: I18n.t('tier.unknown') };
-    tbody.innerHTML = (d.accounts || []).map(a => {
+    const accounts = (d.accounts || []).map(a => (
+      this._expandedAccounts?.has(a.id) && this._accountDetails?.has(a.id)
+        ? { ...a, ...this._accountDetails.get(a.id) }
+        : a
+    ));
+    tbody.innerHTML = accounts.map(a => {
       const tier = a.tier || 'unknown';
       // GetUserStatus snapshot — authoritative plan/trial/credit info (may be null)
       const us = a.userStatus || null;
@@ -3773,12 +3873,13 @@ docker compose up -d --force-recreate</pre>
 
       // Compact summary: avail/total + 编辑 button. Clicking opens modal.
       const tierModels = a.tierModels || [];
-      const blockedCount = (a.blockedModels || []).length;
-      const availCount = tierModels.length - blockedCount;
-      const capsHtml = tierModels.length
+      const tierModelCount = a.tierModelCount ?? tierModels.length;
+      const blockedCount = a.blockedModelCount ?? (a.blockedModels || []).length;
+      const availCount = Math.max(0, tierModelCount - blockedCount);
+      const capsHtml = tierModelCount
         ? `<button class="btn btn-ghost btn-xs" style="min-width:96px" onclick="App.openBlockedModal('${this.escJsAttr(a.id)}')" title="${I18n.t('account.editModels')}">
              <span style="color:var(--success,#10b981);font-weight:600">${availCount}</span>
-             <span style="color:var(--text-dim)">/${tierModels.length}</span>
+             <span style="color:var(--text-dim)">/${tierModelCount}</span>
              ${blockedCount > 0 ? `<span class="badge warn" style="margin-left:4px">-${blockedCount}</span>` : ''}
            </button>`
         : `<span class="text-xs text-dim">-</span>`;
@@ -3896,13 +3997,18 @@ docker compose up -d --force-recreate</pre>
     return this._modelsCatalog;
   },
 
-  toggleAccountDetail(id) {
+  async toggleAccountDetail(id) {
     if (!this._expandedAccounts) this._expandedAccounts = new Set();
     if (this._expandedAccounts.has(id)) {
       this._expandedAccounts.delete(id);
     } else {
       this._expandedAccounts.add(id);
-      this._ensureModelsCatalog().then(() => this.loadAccounts());
+      try {
+        await Promise.all([this._ensureModelsCatalog(), this.getAccountDetail(id)]);
+      } catch (e) {
+        this.toast(e.message || I18n.t('error.openFailed'), 'error');
+      }
+      this.loadAccounts();
       return;
     }
     this.loadAccounts();
@@ -4053,6 +4159,7 @@ docker compose up -d --force-recreate</pre>
     try {
       const r = await this.api('POST', `/accounts/${id}/refresh-credits`, {});
       if (r.ok) {
+        this._accountDetails?.delete(id);
         this.toast(I18n.t('toast.credits.refreshed'));
         this.loadAccounts();
       } else {
@@ -4068,6 +4175,7 @@ docker compose up -d --force-recreate</pre>
       if (r.success) {
         const okCount = (r.results || []).filter(x => x.ok).length;
         const failCount = (r.results || []).length - okCount;
+        this._accountDetails?.clear();
         this.toast(I18n.t('toast.credits.allRefreshed', { ok: okCount, fail: failCount }));
         this.loadAccounts();
       } else {
@@ -4083,6 +4191,7 @@ docker compose up -d --force-recreate</pre>
       if (r.success) {
         const tierLabel = { pro: 'Pro', free: 'Free', expired: I18n.t('tier.expiredLabel'), unknown: I18n.t('tier.unknown') };
         const summary = (r.results || []).map(x => `${x.email}: ${tierLabel[x.tier] || x.tier || x.error}`).join('; ');
+        this._accountDetails?.clear();
         this.toast(I18n.t('toast.probeAllComplete', { summary }));
         this.loadAccounts();
       } else {
@@ -4097,6 +4206,7 @@ docker compose up -d --force-recreate</pre>
       const r = await this.api('POST', `/accounts/${id}/probe`, {});
       if (r.success) {
         const tierLabel = { pro: 'Pro', free: 'Free', expired: I18n.t('tier.expiredLabel'), unknown: I18n.t('tier.unknown') };
+        this._accountDetails?.delete(id);
         this.toast(I18n.t('toast.probeComplete', { tier: tierLabel[r.tier] || r.tier }));
         this.loadAccounts();
       } else {
@@ -4107,8 +4217,7 @@ docker compose up -d --force-recreate</pre>
 
   async openBlockedModal(id) {
     try {
-      const d = await this.api('GET', '/accounts', null);
-      const acct = (d.accounts || []).find(a => a.id === id);
+      const acct = await this.getAccountDetail(id, { force: true });
       if (!acct) return this.toast(I18n.t('error.accountNotFound'), 'error');
       const tierModels = acct.tierModels || [];
       const blocked = new Set(acct.blockedModels || []);
@@ -4222,6 +4331,7 @@ docker compose up -d --force-recreate</pre>
       try {
         const r = await self.api('PATCH', `/accounts/${id}`, { blockedModels: newBlocked });
         if (r.success) {
+          self._accountDetails?.delete(id);
           self.toast(I18n.t('modal.blockedModels.saved', {enabled: root.querySelectorAll('.blocked-model-cb:checked').length, disabled: newBlocked.length}), 'success');
           root.remove();
           self.loadAccounts();
@@ -4260,7 +4370,7 @@ docker compose up -d --force-recreate</pre>
     if (!key) return this.toast(I18n.t('toast.enterKeyOrToken'), 'error');
     const body = type === 'api_key' ? { api_key: key, label, proxy } : { token: key, label, proxy };
     const r = await this.api('POST', '/accounts', body);
-    if (r.success) { this.toast(I18n.t('account.addSuccess')); document.getElementById('acc-key').value = ''; document.getElementById('acc-label').value = ''; document.getElementById('acc-proxy').value = ''; this.loadAccounts(); }
+    if (r.success) { this.toast(I18n.t('account.addSuccess')); document.getElementById('acc-key').value = ''; document.getElementById('acc-label').value = ''; document.getElementById('acc-proxy').value = ''; this.accountsPage = 1; this._accountDetails?.clear(); this.loadAccounts(); }
     else this.toast(this.translateError(r.error, 'toast.addFailed'), 'error');
   },
 
@@ -4379,6 +4489,8 @@ docker compose up -d --force-recreate</pre>
     const r = await this.api('POST', '/accounts', { api_key: acc.apiKey, label: acc.label });
     if (r.success) {
       this.toast(I18n.t('localImport.importSuccess', { email: acc.email || acc.label }));
+      this.accountsPage = 1;
+      this._accountDetails?.clear();
       this.loadAccounts();
     } else {
       const errKey = r.error ? `error.${r.error}` : null;
@@ -4387,7 +4499,7 @@ docker compose up -d --force-recreate</pre>
     }
   },
 
-  async toggleAccount(id, status) { await this.api('PATCH', `/accounts/${id}`, { status }); this.loadAccounts(); },
+  async toggleAccount(id, status) { await this.api('PATCH', `/accounts/${id}`, { status }); this._accountDetails?.delete(id); this.loadAccounts(); },
 
   async overrideTier(id, current) {
     const newTier = await this.prompt(
@@ -4401,14 +4513,17 @@ docker compose up -d --force-recreate</pre>
     );
     if (!newTier) return;
     await this.api('PATCH', `/accounts/${id}`, { tier: newTier.tier });
+    this._accountDetails?.delete(id);
     this.toast(I18n.t('account.tierSet', {tier: newTier.tier}), 'success');
     this.loadAccounts();
   },
-  async resetErrors(id) { await this.api('PATCH', `/accounts/${id}`, { resetErrors: true }); this.loadAccounts(); this.toast(I18n.t('account.resetErrors')); },
+  async resetErrors(id) { await this.api('PATCH', `/accounts/${id}`, { resetErrors: true }); this._accountDetails?.delete(id); this.loadAccounts(); this.toast(I18n.t('account.resetErrors')); },
   async deleteAccount(id) {
     const ok = await this.confirm(I18n.t('modal.deleteAccount.title'), I18n.t('modal.deleteAccount.desc'), { danger: true, okText: I18n.t('action.delete') });
     if (!ok) return;
     await this.api('DELETE', `/accounts/${id}`);
+    this._accountDetails?.delete(id);
+    this._expandedAccounts?.delete(id);
     this.loadAccounts();
     this.toast(I18n.t('account.deleteSuccess'));
   },
@@ -4522,7 +4637,7 @@ docker compose up -d --force-recreate</pre>
       document.getElementById('proxy-pass').placeholder = I18n.t('proxy.placeholderPassword');
       document.getElementById('proxy-current').textContent = I18n.t('proxy.notConfigured');
     }
-    const accts = await this.api('GET', '/accounts');
+    const accts = await this.api('GET', '/accounts?view=summary&pageSize=1000');
     const tbody = document.querySelector('#proxy-accounts-table tbody');
     const pa = d.perAccount || {};
     tbody.innerHTML = (accts.accounts || []).map(a => {
@@ -5879,23 +5994,25 @@ docker compose up -d --force-recreate</pre>
 
   // ─── Ban Detection ───────────────────────────
   async loadBans() {
-    const d = await this.api('GET', '/accounts');
+    const d = await this.api('GET', '/accounts?view=summary&filter=flagged&pageSize=500');
     const accounts = d.accounts || [];
-    const errored = accounts.filter(a => a.status === 'error' || a.errorCount > 0);
+    const stats = d.stats || {};
+    const errored = accounts.filter(a => a.status === 'error' || a.errorCount > 0 || a.rateLimited);
+    const total = stats.total ?? d.total ?? accounts.length;
     document.getElementById('ban-cards').innerHTML = `
       <div class="card ${errored.length > 0 ? 'error' : 'success'}">
         <div class="card-header"><div class="card-title">${I18n.t('card.abnormalAccounts.title')}</div></div>
-        <div class="card-value">${errored.length}</div>
-        <div class="card-sub">${I18n.t('card.abnormalAccounts.subtitle', { count: accounts.length })}</div>
+        <div class="card-value">${stats.flagged ?? errored.length}</div>
+        <div class="card-sub">${I18n.t('card.abnormalAccounts.subtitle', { count: total })}</div>
       </div>
       <div class="card warn">
         <div class="card-header"><div class="card-title">${I18n.t('card.disabled.title')}</div></div>
-        <div class="card-value">${accounts.filter(a => a.status === 'error').length}</div>
+        <div class="card-value">${stats.error ?? accounts.filter(a => a.status === 'error').length}</div>
         <div class="card-sub">${I18n.t('card.disabled.subtitle')}</div>
       </div>
       <div class="card info">
         <div class="card-header"><div class="card-title">${I18n.t('card.rateLimit.title')}</div></div>
-        <div class="card-value">${accounts.filter(a => a.rateLimited).length}</div>
+        <div class="card-value">${stats.rateLimited ?? accounts.filter(a => a.rateLimited).length}</div>
         <div class="card-sub">${I18n.t('card.rateLimit.subtitle')}</div>
       </div>
     `;

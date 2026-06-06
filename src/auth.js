@@ -1306,65 +1306,106 @@ export function maskApiKey(key = '') {
   return `${s.slice(0, 8)}...${s.slice(-4)}`;
 }
 
-export function getAccountList() {
-  const now = Date.now();
-  return accounts.map(a => {
-    const rpmLimit = rpmLimitFor(a);
-    const rpmUsed = pruneRpmHistory(a, now);
-    const proxy = getEffectiveProxy(a.id) || null;
-    const lsAdmission = getLsAdmissionStatus(proxy);
-    return {
-      id: a.id,
-      email: a.email,
-      method: a.method,
-      status: a.status,
-      errorCount: a.errorCount,
-      lastUsed: a.lastUsed ? new Date(a.lastUsed).toISOString() : null,
-      addedAt: new Date(a.addedAt).toISOString(),
-      keyPrefix: a.apiKey.slice(0, 8) + '...',
-      apiKey_masked: maskApiKey(a.apiKey),
-      tier: a.tier || 'unknown',
-      capabilities: a.capabilities || {},
-      lastProbed: a.lastProbed || 0,
-      rateLimitedUntil: a.rateLimitedUntil || 0,
-      rateLimited: !!(a.rateLimitedUntil && a.rateLimitedUntil > now),
-      modelRateLimits: a._modelRateLimits ? Object.fromEntries(
-        Object.entries(a._modelRateLimits).filter(([, v]) => v > now)
-      ) : {},
-      rpmUsed,
-      rpmLimit,
-      credits: a.credits || null,
-      blockedModels: a.blockedModels || [],
-      availableModels: getAvailableModelsForAccount(a),
-      tierModels: getTierModels(a.tier || 'unknown'),
-      userStatus: a.userStatus || null,
-      userStatusLastFetched: a.userStatusLastFetched || 0,
-      lsAdmission: {
-        ok: lsAdmission.ok,
-        reason: lsAdmission.reason,
-        errorType: lsAdmission.errorType,
-        key: lsAdmission.key,
-        wouldStart: lsAdmission.wouldStart,
-        poolSize: lsAdmission.poolSize,
-        effectivePoolSize: lsAdmission.effectivePoolSize,
-        maxInstances: lsAdmission.maxInstances,
-        pending: !!lsAdmission.pending,
-        poolFull: !!lsAdmission.poolFull,
-        willEvict: !!lsAdmission.willEvict,
-        idleEvictableCount: lsAdmission.idleEvictableCount || 0,
-        evictionCandidateKey: lsAdmission.evictionCandidateKey || null,
-        memoryGuard: {
-          okToSpawn: lsAdmission.memoryGuard?.okToSpawn ?? null,
-          availableBytes: lsAdmission.memoryGuard?.availableBytes ?? null,
-          minAvailableBytes: lsAdmission.memoryGuard?.minAvailableBytes ?? null,
-          estimatedRssBytesPerInstance: lsAdmission.memoryGuard?.estimatedRssBytesPerInstance ?? null,
-          observedRssEstimateBytes: lsAdmission.memoryGuard?.observedRssEstimateBytes ?? null,
-          minAvailableBytesSource: lsAdmission.memoryGuard?.minAvailableBytesSource ?? null,
-          reservedStarts: lsAdmission.memoryGuard?.reservedStarts ?? null,
-        },
+function accountUserStatusSummary(userStatus) {
+  if (!userStatus) return null;
+  const { allowedModels, ...rest } = userStatus;
+  return {
+    ...rest,
+    allowedModelCount: Array.isArray(allowedModels) ? allowedModels.length : 0,
+  };
+}
+
+function publicAccount(a, now, { view = 'full' } = {}) {
+  const rpmLimit = rpmLimitFor(a);
+  const rpmUsed = pruneRpmHistory(a, now);
+  const tierModels = getTierModels(a.tier || 'unknown');
+  const base = {
+    id: a.id,
+    email: a.email,
+    method: a.method,
+    status: a.status,
+    errorCount: a.errorCount,
+    lastUsed: a.lastUsed ? new Date(a.lastUsed).toISOString() : null,
+    addedAt: new Date(a.addedAt).toISOString(),
+    keyPrefix: a.apiKey.slice(0, 8) + '...',
+    apiKey_masked: maskApiKey(a.apiKey),
+    tier: a.tier || 'unknown',
+    lastProbed: a.lastProbed || 0,
+    rateLimitedUntil: a.rateLimitedUntil || 0,
+    rateLimited: !!(a.rateLimitedUntil && a.rateLimitedUntil > now),
+    rpmUsed,
+    rpmLimit,
+    credits: a.credits || null,
+    blockedModelCount: (a.blockedModels || []).length,
+    tierModelCount: tierModels.length,
+    userStatus: accountUserStatusSummary(a.userStatus),
+    userStatusLastFetched: a.userStatusLastFetched || 0,
+  };
+  if (view === 'summary') return base;
+
+  const proxy = getEffectiveProxy(a.id) || null;
+  const lsAdmission = getLsAdmissionStatus(proxy);
+  return {
+    ...base,
+    capabilities: a.capabilities || {},
+    modelRateLimits: a._modelRateLimits ? Object.fromEntries(
+      Object.entries(a._modelRateLimits).filter(([, v]) => v > now)
+    ) : {},
+    blockedModels: a.blockedModels || [],
+    availableModels: getAvailableModelsForAccount(a),
+    tierModels,
+    userStatus: a.userStatus || null,
+    lsAdmission: {
+      ok: lsAdmission.ok,
+      reason: lsAdmission.reason,
+      errorType: lsAdmission.errorType,
+      key: lsAdmission.key,
+      wouldStart: lsAdmission.wouldStart,
+      poolSize: lsAdmission.poolSize,
+      effectivePoolSize: lsAdmission.effectivePoolSize,
+      maxInstances: lsAdmission.maxInstances,
+      pending: !!lsAdmission.pending,
+      poolFull: !!lsAdmission.poolFull,
+      willEvict: !!lsAdmission.willEvict,
+      idleEvictableCount: lsAdmission.idleEvictableCount || 0,
+      evictionCandidateKey: lsAdmission.evictionCandidateKey || null,
+      memoryGuard: {
+        okToSpawn: lsAdmission.memoryGuard?.okToSpawn ?? null,
+        availableBytes: lsAdmission.memoryGuard?.availableBytes ?? null,
+        minAvailableBytes: lsAdmission.memoryGuard?.minAvailableBytes ?? null,
+        estimatedRssBytesPerInstance: lsAdmission.memoryGuard?.estimatedRssBytesPerInstance ?? null,
+        observedRssEstimateBytes: lsAdmission.memoryGuard?.observedRssEstimateBytes ?? null,
+        minAvailableBytesSource: lsAdmission.memoryGuard?.minAvailableBytesSource ?? null,
+        reservedStarts: lsAdmission.memoryGuard?.reservedStarts ?? null,
       },
-    };
-  });
+    },
+  };
+}
+
+export function getAccountList({ view = 'full', offset = 0, limit = Infinity, filter = '' } = {}) {
+  const now = Date.now();
+  let list = accounts;
+  if (filter === 'flagged') {
+    list = list.filter(a => a.status === 'error' || (a.errorCount || 0) > 0 || (a.rateLimitedUntil && a.rateLimitedUntil > now));
+  }
+  const start = Math.max(0, Number.isFinite(offset) ? offset : 0);
+  const end = Number.isFinite(limit) ? start + Math.max(0, limit) : undefined;
+  return list.slice(start, end).map(a => publicAccount(a, now, { view }));
+}
+
+export function getAccountPublic(id, { view = 'full' } = {}) {
+  const account = accounts.find(a => a.id === id);
+  return account ? publicAccount(account, Date.now(), { view }) : null;
+}
+
+export function getAccountListStats() {
+  const now = Date.now();
+  return {
+    ...getAccountCount(),
+    flagged: accounts.filter(a => a.status === 'error' || (a.errorCount || 0) > 0 || (a.rateLimitedUntil && a.rateLimitedUntil > now)).length,
+    rateLimited: accounts.filter(a => a.rateLimitedUntil && a.rateLimitedUntil > now).length,
+    disabled: accounts.filter(a => a.status !== 'active').length,
+  };
 }
 
 export function getAccountInternal(id) {

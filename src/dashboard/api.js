@@ -7,7 +7,7 @@ import { config, log } from '../config.js';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  getAccountList, getAccountCount, addAccountByKey, addAccountByToken,
+  getAccountList, getAccountCount, getAccountListStats, getAccountPublic, addAccountByKey, addAccountByToken,
   removeAccount, setAccountStatus, resetAccountErrors, updateAccountLabel,
   isAuthenticated, probeAccount, ensureLsForAccount,
   refreshCredits, refreshAllCredits,
@@ -124,6 +124,46 @@ function json(res, status, body) {
     'Access-Control-Allow-Headers': 'Content-Type, X-Dashboard-Password',
   });
   res.end(data);
+}
+
+function dashboardUrl(req) {
+  return new URL(req?.url || '/', 'http://localhost');
+}
+
+function parseBoundedInt(value, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const n = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function getAccountsPayload(req) {
+  const url = dashboardUrl(req);
+  const qs = url.searchParams;
+  const wantsPaged = qs.has('page') || qs.has('pageSize') || qs.has('offset') || qs.has('limit') || qs.has('view') || qs.has('filter');
+  if (!wantsPaged) return { accounts: getAccountList() };
+
+  const view = qs.get('view') === 'summary' ? 'summary' : 'full';
+  const pageSize = parseBoundedInt(qs.get('pageSize') ?? qs.get('limit'), 50, { min: 1, max: 1000 });
+  const page = parseBoundedInt(qs.get('page'), 1, { min: 1, max: 1000000 });
+  const explicitOffset = qs.has('offset')
+    ? parseBoundedInt(qs.get('offset'), 0, { min: 0, max: Number.MAX_SAFE_INTEGER })
+    : null;
+  const offset = explicitOffset ?? ((page - 1) * pageSize);
+  const filter = qs.get('filter') === 'flagged' ? 'flagged' : '';
+  const stats = getAccountListStats();
+  const total = filter === 'flagged' ? stats.flagged : stats.total;
+  const accounts = getAccountList({ view, offset, limit: pageSize, filter });
+  return {
+    accounts,
+    page,
+    pageSize,
+    offset,
+    total,
+    hasMore: offset + accounts.length < total,
+    view,
+    filter,
+    stats,
+  };
 }
 
 // v2.0.56: client IP extraction. Mirrors caller-key.js TRUST_PROXY_XFF
@@ -485,7 +525,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
   // ─── Accounts ─────────────────────────────────────────
   if (subpath === '/accounts' && method === 'GET') {
-    return json(res, 200, { accounts: getAccountList() });
+    return json(res, 200, getAccountsPayload(req));
   }
 
   if (subpath === '/accounts' && method === 'POST') {
@@ -604,7 +644,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
   // POST /accounts/probe-all — probe every active account
   if (subpath === '/accounts/probe-all' && method === 'POST') {
-    const list = getAccountList().filter(a => a.status === 'active');
+    const list = getAccountList({ view: 'summary' }).filter(a => a.status === 'active');
     const force = body?.force === true || body?.allowLsStart === true;
     const results = [];
     for (const a of list) {
@@ -649,6 +689,13 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   if (creditRefresh && method === 'POST') {
     const r = await refreshCredits(creditRefresh[1]);
     return json(res, r.ok ? 200 : 400, r);
+  }
+
+  const accountGet = subpath.match(/^\/accounts\/([^/]+)$/);
+  if (accountGet && method === 'GET') {
+    const account = getAccountPublic(accountGet[1], { view: 'full' });
+    if (!account) return json(res, 404, { error: 'Account not found' });
+    return json(res, 200, { account });
   }
 
   // PATCH /accounts/:id
@@ -1408,8 +1455,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   // POST /accounts/:id/rate-limit — check capacity for a single account
   const rateLimitCheck = subpath.match(/^\/accounts\/([^/]+)\/rate-limit$/);
   if (rateLimitCheck && method === 'POST') {
-    const list = getAccountList();
-    const acct = list.find(a => a.id === rateLimitCheck[1]);
+    const acct = getAccountPublic(rateLimitCheck[1], { view: 'summary' });
     if (!acct) return json(res, 404, { error: 'Account not found' });
     const secret = getAccountInternal(acct.id);
     try {

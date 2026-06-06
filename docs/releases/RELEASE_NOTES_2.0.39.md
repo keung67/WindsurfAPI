@@ -7,9 +7,9 @@ VPS 实测 `/auth/login` 邮箱密码模式提交三个真实账号：
 ```
 POST /auth/login
 { "accounts":[
-  {"email":"qxl.n257570.722@gmail.com","password":"..."},
-  {"email":"tc.vmb.7687617@gmail.com","password":"..."},
-  {"email":"ge.jgpmnelfiyo9.15@gmail.com","password":"..."}
+  {"email":"user1@example.com","password":"<password>"},
+  {"email":"user2@example.com","password":"<password>"},
+  {"email":"user3@example.com","password":"<password>"}
 ]}
 ```
 
@@ -55,7 +55,7 @@ throw new Error('Direct email/password login is not supported. Use token-based a
 ```bash
 $ curl -X POST https://windsurf.com/_backend/exa.seat_management_pb.SeatManagementService/CheckUserLoginMethod \
     -H 'Content-Type: application/json' -H 'Connect-Protocol-Version: 1' \
-    -d '{"email":"qxl.n257570.722@gmail.com"}'
+    -d '{"email":"user1@example.com"}'
 {}
 ```
 
