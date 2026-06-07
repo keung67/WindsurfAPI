@@ -6,6 +6,7 @@
 import http from 'http';
 import https from 'https';
 import { log } from '../config.js';
+import { safeEmailRef, safeKeyRef, logHash } from '../log-safety.js';
 import { isSocks, createSocksTunnel } from '../socks.js';
 
 const FIREBASE_API_KEY = 'AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY';
@@ -402,7 +403,7 @@ async function fetchCheckUserLoginMethod(email, fingerprint, proxy) {
     const hasUserField = Object.prototype.hasOwnProperty.call(res.data, 'userExists');
     const hasPwField = Object.prototype.hasOwnProperty.call(res.data, 'hasPassword');
     if (!hasUserField && !hasPwField) {
-      log.warn(`CheckUserLoginMethod empty body for ${email}, falling back to /_devin-auth/connections`);
+      log.warn(`CheckUserLoginMethod empty body for ${safeEmailRef(email)}, falling back to /_devin-auth/connections`);
       return null;
     }
     if (res.data.userExists === false) {
@@ -473,7 +474,7 @@ async function windsurfLoginViaAuth1(email, password, fingerprint, proxy) {
     throw new Error(`ERR_AUTH1_TOKEN_MISSING:${JSON.stringify(loginRes.data).slice(0, 200)}`);
   }
 
-  log.info(`Auth1 login OK: ${email}`);
+  log.info(`Auth1 login OK: ${safeEmailRef(email)}`);
 
   // v2.0.90 (#114 lnqdev / CharwinYAO): drop OneTimeAuthToken + Codeium
   // register_user step entirely. Upstream GetOneTimeAuthToken started
@@ -511,7 +512,7 @@ async function windsurfLoginViaAuth1(email, password, fingerprint, proxy) {
   }
   const sessionToken = br.data.sessionToken;
   const accountId = br.data.accountId || 'unknown';
-  log.info(`Windsurf PostAuth OK (${bl}): ${email} account=${accountId} → using sessionToken as apiKey`);
+  log.info(`Windsurf PostAuth OK (${bl}): ${safeEmailRef(email)} accountHash=${logHash(accountId)} → using sessionToken as apiKey`);
 
   return {
     apiKey: sessionToken,
@@ -541,10 +542,10 @@ async function windsurfLoginViaFirebase(email, password, fingerprint, proxy) {
   const idToken = fbRes.data.idToken;
   if (!idToken) throw new Error('ERR_FIREBASE_TOKEN_MISSING');
 
-  log.info(`Firebase login OK: ${email}, UID=${fbRes.data.localId}`);
+  log.info(`Firebase login OK: ${safeEmailRef(email)}, uidHash=${logHash(fbRes.data.localId)}`);
 
   const reg = await registerWithCodeium(idToken, fingerprint, proxy);
-  log.info(`Codeium register OK: ${email} → key=${reg.api_key.slice(0, 20)}...`);
+  log.info(`Codeium register OK: ${safeEmailRef(email)} → ${safeKeyRef(reg.api_key, 'apiKey')}`);
 
   return {
     apiKey: reg.api_key,
@@ -605,7 +606,7 @@ function recordEmailFailure(email, reason) {
   if (e.count >= EMAIL_LOCK_THRESHOLD) {
     e.lockedUntil = now + EMAIL_LOCK_DURATION_MS;
     e.count = 0;
-    log.warn(`Email lockout: ${k} banned for ${EMAIL_LOCK_DURATION_MS / 60000}min after ${EMAIL_LOCK_THRESHOLD} failed Windsurf logins (last="${e.lastReason}")`);
+    log.warn(`Email lockout: ${safeEmailRef(k)} banned for ${EMAIL_LOCK_DURATION_MS / 60000}min after ${EMAIL_LOCK_THRESHOLD} failed Windsurf logins (last="${e.lastReason}")`);
   }
 }
 
@@ -633,7 +634,7 @@ export async function windsurfLogin(email, password, proxy = null) {
     throw err;
   }
   const fingerprint = generateFingerprint();
-  log.info(`Windsurf login: ${email} fp=${fingerprint['User-Agent'].slice(0, 40)}... proxy=${proxy?.host || 'none'}`);
+  log.info(`Windsurf login: ${safeEmailRef(email)} fpHash=${logHash(fingerprint['User-Agent'])} proxy=${proxy?.host || 'none'}`);
 
   // Probe sequence (per Windsurf 2026-04-26 half-migration):
   //   1. CheckUserLoginMethod (new Connect-RPC, fast + clean shape)
@@ -645,7 +646,7 @@ export async function windsurfLogin(email, password, proxy = null) {
     try {
       auth1Connections = await fetchAuth1Connections(email, fingerprint, proxy);
     } catch (err) {
-      log.warn(`Auth1 connections probe failed for ${email}: ${err.message}`);
+      log.warn(`Auth1 connections probe failed for ${safeEmailRef(email)}: ${err.message}`);
     }
     // interpretConnections handles BOTH the old `{auth_method:{...}}`
     // and the post-2026-04-26 `{connections:[...]}` shape — Windsurf is

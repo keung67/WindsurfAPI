@@ -10,6 +10,7 @@ import { isStickyEnabled, setStickyBinding } from '../account/sticky-session.js'
 import { resolveModel, getModelInfo, pickRateLimitFallback } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
+import { safeAccountRef, safeKeyRef } from '../log-safety.js';
 import { recordRequest, recordTokenUsage, recordPolicyBlocked, recordRateLimited } from '../dashboard/stats.js';
 import { extractIntentFromNarrative, detectToolIntentInNarrative } from './intent-extractor.js';
 import { markRequest as markQuietWindowRequest } from '../dashboard/quiet-window-updater.js';
@@ -2280,7 +2281,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
 
     try {
       if (nativeBridgeOn && !isNativeBridgeAccountAllowed(acct)) {
-        log.info(`Chat[${reqId}]: native bridge account gate skipped ${acct.email || acct.id || '(unknown)'}`);
+        log.info(`Chat[${reqId}]: native bridge account gate skipped ${safeAccountRef(acct)}`);
         continue;
       }
     // Pre-flight rate limit check (experimental): ask server.codeium.com if
@@ -2290,7 +2291,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
         const px = getEffectiveProxy(acct.id) || null;
         const rl = await checkMessageRateLimitFn(acct.apiKey, px);
         if (!rl.hasCapacity) {
-          log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
+          log.warn(`Preflight: ${safeAccountRef(acct)} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
           refundReservation(acct.apiKey, acct.reservationTimestamp);
           if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
             markRateLimited(acct.apiKey, rl.retryAfterMs, routingModelKey);
@@ -2315,7 +2316,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
           continue;
         }
       } catch (e) {
-        log.debug(`Preflight check failed for ${acct.email}: ${e.message}`);
+        log.debug(`Preflight check failed for ${safeAccountRef(acct)}: ${e.message}`);
         // Fail open — proceed with the request
       }
     }
@@ -2337,7 +2338,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       const c = m?.content;
       return n + (typeof c === 'string' ? c.length : Array.isArray(c) ? c.reduce((k, p) => k + (typeof p?.text === 'string' ? p.text.length : 0), 0) : 0);
     }, 0);
-    log.info(`Chat[${reqId}]: model=${displayModel} flow=${useCascade ? 'cascade' : 'legacy'} attempt=${attempt + 1} account=${acct.email} ls=${ls.port} turns=${(messages||[]).length} chars=${_msgChars}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
+    log.info(`Chat[${reqId}]: model=${displayModel} flow=${useCascade ? 'cascade' : 'legacy'} attempt=${attempt + 1} ${safeAccountRef(acct)} ls=${ls.port} turns=${(messages||[]).length} chars=${_msgChars}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
     const client = new WindsurfClientClass(acct.apiKey, ls.port, ls.csrfToken);
     const result = await nonStreamResponse(
       client, chatId, created, displayModel, routingModelKey, messages, cascadeMessages, modelEnum, modelUid,
@@ -2426,10 +2427,10 @@ async function _handleChatCompletionsInner(body, context = {}) {
         };
       }
       if (acct?._sticky && isExperimentalEnabled('stickyNoFallback')) {
-        log.warn(`Account ${acct.email} (sticky-bound) rate-limited on ${displayModel}, stickyNoFallback enabled — not trying other accounts`);
+        log.warn(`Account ${safeAccountRef(acct)} (sticky-bound) rate-limited on ${displayModel}, stickyNoFallback enabled — not trying other accounts`);
         break;
       }
-      log.warn(`Account ${acct.email} rate-limited on ${displayModel}, trying next account`);
+      log.warn(`Account ${safeAccountRef(acct)} rate-limited on ${displayModel}, trying next account`);
       continue;
     }
     // Cascade transient 错误通常是上游或本地 LS 短暂抖动，先退避再切账号，避免连续打爆同一热窗口。
@@ -2438,21 +2439,21 @@ async function _handleChatCompletionsInner(body, context = {}) {
     }
     if (errType === 'upstream_internal_error' || errType === 'upstream_transient_error') {
       if (acct?._sticky && isExperimentalEnabled('stickyNoFallback')) {
-        log.warn(`Chat[${reqId}]: ${acct.email} (sticky-bound) upstream transient error, stickyNoFallback enabled — not trying other accounts`);
+        log.warn(`Chat[${reqId}]: ${safeAccountRef(acct)} (sticky-bound) upstream transient error, stickyNoFallback enabled — not trying other accounts`);
         break;
       }
       internalCount++;
       const backoffMs = await internalErrorBackoff(internalCount - 1);
-      log.warn(`Chat[${reqId}]: ${acct.email} upstream transient error, waited ${backoffMs}ms before next account`);
+      log.warn(`Chat[${reqId}]: ${safeAccountRef(acct)} upstream transient error, waited ${backoffMs}ms before next account`);
       continue;
     }
     // Model not available on this account (permission_denied, etc.)
     if (errType === 'model_not_available') {
       if (acct?._sticky && isExperimentalEnabled('stickyNoFallback')) {
-        log.warn(`Account ${acct.email} (sticky-bound) cannot serve ${displayModel}, stickyNoFallback enabled — not trying other accounts`);
+        log.warn(`Account ${safeAccountRef(acct)} (sticky-bound) cannot serve ${displayModel}, stickyNoFallback enabled — not trying other accounts`);
         break;
       }
-      log.warn(`Account ${acct.email} cannot serve ${displayModel}, trying next account`);
+      log.warn(`Account ${safeAccountRef(acct)} cannot serve ${displayModel}, trying next account`);
       continue;
     }
     break; // other errors (502, transport) — don't retry
@@ -3547,7 +3548,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
           try {
             if (nativeBridgeOn && !isNativeBridgeAccountAllowed(acct)) {
               recordNativeBridgeAccountGateSkip();
-              log.info(`Chat[${reqId}]: native bridge account gate skipped ${acct.email || acct.id || '(unknown)'}`);
+              log.info(`Chat[${reqId}]: native bridge account gate skipped ${safeAccountRef(acct)}`);
               continue;
             }
           // Pre-flight rate limit check (experimental)
@@ -3556,7 +3557,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               const px = getEffectiveProxy(acct.id) || null;
               const rl = await checkMessageRateLimitFn(acct.apiKey, px);
               if (!rl.hasCapacity) {
-                log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
+                log.warn(`Preflight: ${safeAccountRef(acct)} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
                 refundReservation(acct.apiKey, acct.reservationTimestamp);
                 if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
                   markRateLimited(acct.apiKey, rl.retryAfterMs, modelKey);
@@ -3574,7 +3575,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 continue;
               }
             } catch (e) {
-              log.debug(`Preflight check failed for ${acct.email}: ${e.message}`);
+              log.debug(`Preflight check failed for ${safeAccountRef(acct)}: ${e.message}`);
             }
           }
 
@@ -3595,7 +3596,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             const c = m?.content;
             return n + (typeof c === 'string' ? c.length : Array.isArray(c) ? c.reduce((k, p) => k + (typeof p?.text === 'string' ? p.text.length : 0), 0) : 0);
           }, 0);
-          log.info(`Chat: model=${model} flow=${useCascade ? 'cascade' : 'legacy'} stream=true attempt=${attempt + 1} account=${acct.email} ls=${ls.port} turns=${(messages||[]).length} chars=${_msgCharsStream}${reuseEntry ? ' reuse=1' : ''}`);
+          log.info(`Chat: model=${model} flow=${useCascade ? 'cascade' : 'legacy'} stream=true attempt=${attempt + 1} ${safeAccountRef(acct)} ls=${ls.port} turns=${(messages||[]).length} chars=${_msgCharsStream}${reuseEntry ? ' reuse=1' : ''}`);
           const client = new ClientClass(acct.apiKey, ls.port, ls.csrfToken);
           let cascadeResult = null;
           try {
@@ -3945,7 +3946,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             // out of the retry loop immediately and let the SSE error
             // path emit a 451-style chunk to the client.
             if (isPolicyBlocked) {
-              log.warn(`Chat[${reqId}] stream: policy_blocked on ${currentApiKey?.slice(0, 12)}..., not retrying`);
+              log.warn(`Chat[${reqId}] stream: policy_blocked on ${safeKeyRef(currentApiKey, 'apiKey')}, not retrying`);
               break;
             }
             if (isDeadline) {
@@ -3957,16 +3958,16 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             if (!hadSuccess && (err.isModelError || isRateLimit)) {
               if (acct?._sticky && isExperimentalEnabled('stickyNoFallback')) {
                 const tag = isRateLimit ? 'rate_limit' : isTransient ? 'upstream_transient' : 'model_error';
-                log.warn(`Account ${acct.email} (sticky-bound) failed (${tag}) on ${model}, stickyNoFallback enabled — not trying other accounts`);
+                log.warn(`Account ${safeAccountRef(acct)} (sticky-bound) failed (${tag}) on ${model}, stickyNoFallback enabled — not trying other accounts`);
                 break;
               }
               const tag = isRateLimit ? 'rate_limit' : isTransient ? 'upstream_transient' : 'model_error';
               if (isTransient) {
                 streamInternalCount++;
                 const backoffMs = await internalErrorBackoff(streamInternalCount - 1);
-                log.warn(`Chat[${reqId}] stream: ${acct.email} upstream transient error (${isTransport ? 'cascade_transport' : 'internal_error'}), waited ${backoffMs}ms before next account`);
+                log.warn(`Chat[${reqId}] stream: ${safeAccountRef(acct)} upstream transient error (${isTransport ? 'cascade_transport' : 'internal_error'}), waited ${backoffMs}ms before next account`);
               } else {
-                log.warn(`Account ${acct.email} failed (${tag}) on ${model}, trying next`);
+                log.warn(`Account ${safeAccountRef(acct)} failed (${tag}) on ${model}, trying next`);
               }
               continue;
             }

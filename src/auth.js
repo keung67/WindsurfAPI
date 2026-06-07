@@ -15,6 +15,7 @@ import { isStickyEnabled, getStickyBinding, setStickyBinding, clearStickyBinding
 import { isExperimentalEnabled } from './runtime-config.js';
 import { readFileSync, writeFileSync, existsSync, unlinkSync, readdirSync } from 'fs';
 import { config, log } from './config.js';
+import { safeAccountRef } from './log-safety.js';
 import { renameSyncWithRetry } from './fs-atomic.js';
 import { getEffectiveProxy } from './dashboard/proxy-config.js';
 import { getTierModels, getModelKeysByEnum, MODELS, registerDiscoveredFreeModel } from './models.js';
@@ -429,7 +430,7 @@ export function addAccountByKey(apiKey, label = '', apiServerUrl = '') {
   account.credits = null;
   accounts.push(account);
   saveAccounts();
-  log.info(`Account added: ${account.id} (${account.email}) [api_key]`);
+  log.info(`Account added: ${safeAccountRef(account)} [api_key]`);
   return account;
 }
 
@@ -462,7 +463,7 @@ export async function addAccountByToken(token, label = '') {
   };
   accounts.push(account);
   saveAccounts();
-  log.info(`Account added: ${account.id} (${account.email}) [token] server=${account.apiServerUrl}`);
+  log.info(`Account added: ${safeAccountRef(account)} [token] server=${account.apiServerUrl}`);
   return account;
 }
 
@@ -507,7 +508,7 @@ export async function addAccountByEmail(email, password) {
     });
   }
   saveAccounts();
-  log.info(`Account added via email: ${account.id} (${account.email})`);
+  log.info(`Account added via email: ${safeAccountRef(account)}`);
   return account;
 }
 
@@ -666,7 +667,7 @@ export function removeAccount(id) {
   // Drop any Cascade conversations owned by this key so future requests
   // don't try to resume on an account that no longer exists.
   import('./conversation-pool.js').then(m => m.invalidateFor({ apiKey: account.apiKey })).catch(() => {});
-  log.info(`Account removed: ${id} (${account.email})`);
+  log.info(`Account removed: ${safeAccountRef(account)}`);
   return true;
 }
 
@@ -883,7 +884,7 @@ function startInflightCleanup() {
     const now = Date.now();
     for (const a of accounts) {
       if ((a._inflight || 0) > 0 && a._inflightAt && (now - a._inflightAt) > INFLIGHT_STALE_MS) {
-        log.warn(`Account ${a.id} (${a.email}) inflight=${a._inflight} stale >${Math.round((now - a._inflightAt) / 1000)}s, auto-resetting`);
+        log.warn(`Account ${safeAccountRef(a)} inflight=${a._inflight} stale >${Math.round((now - a._inflightAt) / 1000)}s, auto-resetting`);
         a._inflight = 0;
         a._inflightAt = 0;
       }
@@ -1061,10 +1062,10 @@ export function markRateLimited(apiKey, durationMs = 5 * 60 * 1000, modelKey = n
   if (modelKey) {
     if (!account._modelRateLimits) account._modelRateLimits = {};
     account._modelRateLimits[modelKey] = Math.max(account._modelRateLimits[modelKey] || 0, until);
-    log.warn(`Account ${account.id} (${account.email}) rate-limited on ${modelKey} for ${Math.round(safeMs / 60000)} min`);
+    log.warn(`Account ${safeAccountRef(account)} rate-limited on ${modelKey} for ${Math.round(safeMs / 60000)} min`);
   } else {
     account.rateLimitedUntil = Math.max(account.rateLimitedUntil || 0, until);
-    log.warn(`Account ${account.id} (${account.email}) rate-limited (all models) for ${Math.round(safeMs / 60000)} min`);
+    log.warn(`Account ${safeAccountRef(account)} rate-limited (all models) for ${Math.round(safeMs / 60000)} min`);
   }
 }
 
@@ -1105,7 +1106,7 @@ export function reportError(apiKey) {
   account.errorCount++;
   if (account.errorCount >= 3) {
     account.status = 'error';
-    log.warn(`Account ${account.id} (${account.email}) disabled after ${account.errorCount} errors`);
+    log.warn(`Account ${safeAccountRef(account)} disabled after ${account.errorCount} errors`);
   }
 }
 
@@ -1141,7 +1142,7 @@ export function reportInternalError(apiKey) {
   account.internalErrorStreak = (account.internalErrorStreak || 0) + 1;
   if (account.internalErrorStreak >= 2) {
     account.rateLimitedUntil = Date.now() + 5 * 60 * 1000;
-    log.warn(`Account ${account.id} (${account.email}) quarantined 5min after ${account.internalErrorStreak} consecutive upstream internal errors`);
+    log.warn(`Account ${safeAccountRef(account)} quarantined 5min after ${account.internalErrorStreak} consecutive upstream internal errors`);
   }
 }
 
@@ -1194,13 +1195,13 @@ export function reportBanSignal(apiKey, message, { windowMs = 30 * 60 * 1000 } =
   account._banSignalAt = now;
   account._banSignalCount = (now - last < windowMs) ? (account._banSignalCount || 0) + 1 : 1;
   account._banSignalLastMessage = String(message || '').slice(0, 240);
-  log.warn(`Account ${account.id} (${account.email}) emitted ban-shaped error #${account._banSignalCount}: "${account._banSignalLastMessage}"`);
+  log.warn(`Account ${safeAccountRef(account)} emitted ban-shaped error #${account._banSignalCount}: "${account._banSignalLastMessage}"`);
   if (account._banSignalCount >= 2) {
     account.status = 'banned';
     account.bannedAt = now;
     account.bannedReason = account._banSignalLastMessage;
     saveAccounts();
-    log.error(`Account ${account.id} (${account.email}) marked BANNED after ${account._banSignalCount} ban-shaped errors`);
+    log.error(`Account ${safeAccountRef(account)} marked BANNED after ${account._banSignalCount} ban-shaped errors`);
     // Drop any cascade-pool entries owned by this key.
     import('./conversation-pool.js').then(m => m.invalidateFor({ apiKey })).catch(() => {});
     return true;
@@ -1543,7 +1544,7 @@ export async function fetchUserStatus(id, { allowLsStart = true } = {}) {
   try {
     status = await client.getUserStatus();
   } catch (err) {
-    log.warn(`GetUserStatus ${account.id} (${account.email}) failed: ${err.message}`);
+    log.warn(`GetUserStatus ${safeAccountRef(account)} failed: ${err.message}`);
     return null;
   }
 
@@ -1593,9 +1594,9 @@ export async function fetchUserStatus(id, { allowLsStart = true } = {}) {
   }
 
   if (prevTier !== account.tier) {
-    log.info(`Tier change ${account.id} (${account.email}): ${prevTier} → ${account.tier} (plan="${status.planName}", ${status.allowedModels.length} allowed models)`);
+    log.info(`Tier change ${safeAccountRef(account)}: ${prevTier} → ${account.tier} (plan="${status.planName}", ${status.allowedModels.length} allowed models)`);
   } else {
-    log.info(`UserStatus ${account.id} (${account.email}): tier=${account.tier} plan="${status.planName}" allowed=${status.allowedModels.length}`);
+    log.info(`UserStatus ${safeAccountRef(account)}: tier=${account.tier} plan="${status.planName}" allowed=${status.allowedModels.length}`);
   }
   saveAccounts();
   return status;
@@ -1710,7 +1711,7 @@ async function _probeAccountImpl(account, { allowLsStart = true } = {}) {
   });
 
   if (needsProbe.length > 0) {
-    log.info(`Probing account ${account.id} (${account.email}) across ${needsProbe.length} canary models (GetUserStatus ${status ? 'OK' : 'unavailable'})`);
+    log.info(`Probing ${safeAccountRef(account)} across ${needsProbe.length} canary models (GetUserStatus ${status ? 'OK' : 'unavailable'})`);
 
     for (const modelKey of needsProbe) {
       const info = getModelInfo(modelKey);
@@ -1758,7 +1759,7 @@ async function _probeAccountImpl(account, { allowLsStart = true } = {}) {
     }).slice(0, MAX_CLOUD_PROBES);
 
     if (cloudCandidates.length > 0) {
-      log.info(`Dynamic cloud probe: ${cloudCandidates.length} candidates for ${account.email} (cap=${MAX_CLOUD_PROBES})`);
+      log.info(`Dynamic cloud probe: ${cloudCandidates.length} candidates for ${safeAccountRef(account)} (cap=${MAX_CLOUD_PROBES})`);
       let rateLimited = false;
       for (const modelKey of cloudCandidates) {
         if (rateLimited) break;
@@ -2010,12 +2011,12 @@ async function refreshAllFirebaseTokens({ skipBusy = false } = {}) {
       // Re-register to get a fresh API key (may be the same key)
       const { apiKey } = await reRegisterWithCodeium(idToken, proxy);
       if (apiKey && apiKey !== a.apiKey) {
-        log.info(`Firebase refresh: ${a.email} got new API key`);
+        log.info(`Firebase refresh: ${safeAccountRef(a)} got new API key`);
         a.apiKey = apiKey;
       }
       saveAccounts();
     } catch (e) {
-      log.warn(`Firebase refresh ${a.email} failed: ${e.message}`);
+      log.warn(`Firebase refresh ${safeAccountRef(a)} failed: ${e.message}`);
     }
   }
 }

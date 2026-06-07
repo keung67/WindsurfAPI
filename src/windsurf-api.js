@@ -18,6 +18,7 @@
 import http from 'http';
 import https from 'https';
 import { log } from './config.js';
+import { safeKeyRef } from './log-safety.js';
 
 const SERVER_HOSTS = [
   'server.codeium.com',
@@ -401,7 +402,7 @@ export async function registerWithFirebaseToken(firebaseToken, opts = {}) {
         if (source === 'legacy') {
           log.warn(`RegisterUser fell back to legacy api.codeium.com (new endpoint failed)`);
         } else {
-          log.info(`RegisterUser via register.windsurf.com OK (key=${apiKey.slice(0, 12)}...)`);
+          log.info(`RegisterUser via register.windsurf.com OK (${safeKeyRef(apiKey, 'apiKey')})`);
         }
         return { apiKey, name, apiServerUrl, source };
       }
