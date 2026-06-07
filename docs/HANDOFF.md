@@ -12,13 +12,14 @@ into this file.
 - Repository: `D:\Project\WindsurfAPI`
 - Local/remote branch state at handoff: `master` is clean and aligned with
   `origin/master`.
-- Last verified repository baseline before this handoff update: `1c47aef`
-  (`fix: surface completed native WebFetch documents (#183)`). After
-  pulling, use `git log -1 --oneline` for the newest commit.
-- Latest release tag: `v2.0.144` at `1c47aef`
+- Last verified repository baseline before this handoff update: `562f98c`
+  (`docs: update handoff for v2.0.144`). After pulling, use
+  `git log -1 --oneline` for the newest commit.
+- Latest release tag: `v2.0.144` at `3945c51`
   (`fix: surface completed native WebFetch documents (#183)`).
 - GitHub open PRs: none.
-- GitHub CI/Pages for `1c47aef`: success.
+- GitHub CI/Pages for `562f98c`: success.
+- GitHub Release workflow for `v2.0.144` / `3945c51`: success.
 - VPS runtime: WindsurfAPI is healthy on release `v2.0.142`, commit
   `72e1b9cf079e`, through the compose entry on `:3003`. v2.0.144 is
   tagged, pushed, and verified in a memory-safe lab, but not yet deployed to
