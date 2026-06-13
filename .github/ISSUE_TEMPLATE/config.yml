@@ -1,5 +1,2 @@
-blank_issues_enabled: false
-contact_links:
-  - name: 安全漏洞私下披露 / Security disclosure
-    url: https://github.com/dwgx/WindsurfAPI/security/advisories/new
-    about: 不要在 public issue 里发 PoC / Never post PoCs in public issues
+blank_issues_enabled: true
+contact_links: []
